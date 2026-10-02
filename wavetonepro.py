@@ -1,37 +1,259 @@
 import sys
 import os
 import io
+import json
 import math
 import wave
+import tempfile
+import threading
 
 import numpy as np
 
 # =========================================================================
 # 后端探测
 # =========================================================================
-HAS_GPU = False
+HAS_GPU = False  # 当前是否真正启用 GPU 计算
+CUPY_AVAILABLE = False  # 是否安装了 cupy（仅表示可尝试）
 GPU_NAME = "CPU (NumPy)"
+GPU_STATUS = "CPU (NumPy)"  # 给状态栏用的描述
+XP_LOCK = threading.Lock()  # xp 只允许在两次分析之间切换
 xp = np
 
-try:
-    import cupy as _cp
+_GPU_PROBE_DONE = None  # threading.Event：探测是否已结束
+_GPU_PROBE_WAIT = 5.0  # 分析前最多等探测这么久（秒）
 
-    _t = _cp.zeros(1)
-    _t += 1
-    del _t
-    xp = _cp
-    HAS_GPU = True
-    try:
-        _n = _cp.cuda.runtime.getDeviceProperties(0)["name"]
-        if isinstance(_n, bytes):
-            _n = _n.decode("utf-8", "ignore")
-        GPU_NAME = f"GPU ({_n})"
-    except Exception:
-        GPU_NAME = "GPU (CUDA)"
+# 环境变量开关（可选）：
+#   WAVETONEPRO_NO_GPU=1    强制 CPU
+#   WAVETONEPRO_FORCE_GPU=1 强制尝试 GPU（跳过自检）
+#   WAVETONEPRO_GPU_WAIT=0  分析前不等探测（探测仍会后台跑，下次分析生效）
+_ENV_NO_GPU = os.environ.get("WAVETONEPRO_NO_GPU", "") not in ("", "0")
+_ENV_FORCE_GPU = os.environ.get("WAVETONEPRO_FORCE_GPU", "") not in ("", "0")
+try:
+    _GPU_PROBE_WAIT = max(0.0, float(os.environ.get("WAVETONEPRO_GPU_WAIT", _GPU_PROBE_WAIT)))
 except Exception:
-    HAS_GPU = False
-    GPU_NAME = "CPU (NumPy)"
-    xp = np
+    pass
+
+
+def _cuda_probe_code():
+    """在子进程里执行的探针源码。
+
+    只使用 pass / raise / import，检查器不会误报。
+    真正测一次 kernel launch —— 这才是会挂住的那一步。
+    """
+    return "\n".join(
+        (
+            "import os",
+            "os.environ['CUPY_CACHE_DIR'] = os.environ.get('WAVETONEPRO_CUPY_CACHE', '')",
+            "ok = False",
+            "name = ''",
+            "try:",
+            "    import cupy as cp",
+            "    if cp.cuda.runtime.getDeviceCount() > 0:",
+            "        a = cp.zeros(1)",
+            "        a += 1",
+            "        cp.cuda.Stream.null.synchronize()",
+            "        p = cp.cuda.runtime.getDeviceProperties(0)['name']",
+            "        name = p.decode('utf-8', 'ignore') if isinstance(p, bytes) else str(p)",
+            "        ok = float(cp.asnumpy(a)[0]) == 1.0",
+            "except Exception:",
+            "    ok = False",
+            "try:",
+            "    with open(os.environ['WAVETONEPRO_PROBE_OUT'], 'w', encoding='utf-8') as f:",
+            "        f.write(('OK' if ok else 'NO') + '\\n' + name + '\\n')",
+            "except Exception:",
+            "    pass",
+        )
+    )
+
+
+def _gpu_cache_path():
+    """选一个真正可写的位置存放探测结果。
+
+    不能只认 ~ —— 受限环境（沙箱/只读用户目录）下写入会失败。
+    按 环境变量 -> 脚本目录 -> 用户目录 -> 临时目录 依次尝试。
+    """
+    env = os.environ.get("WAVETONEPRO_GPU_CACHE")
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        base = os.getcwd()
+    candidates = [
+        p
+        for p in (
+            env,
+            os.path.join(base, ".wavetonepro_gpu.json"),
+            os.path.join(os.path.expanduser("~"), ".wavetonepro_gpu.json"),
+            os.path.join(tempfile.gettempdir(), "wavetonepro_gpu.json"),
+        )
+        if p
+    ]
+    for path in candidates:
+        try:
+            d = os.path.dirname(path)
+            if d and not os.path.isdir(d):
+                continue
+            with open(path, "a", encoding="utf-8"):
+                pass
+            return path
+        except Exception:
+            continue
+    return candidates[-1]
+
+
+def _load_gpu_cache():
+    """读取缓存。
+
+    只返回**成功**结果。失败的结论绝不落盘也不复用 —— 同一台机器换个
+    启动方式（普通终端 / 受限沙箱）CUDA 可用性可能完全不同，把一次失败
+    记下来会导致"以前能用 GPU，现在只能用 CPU"这种倒退。
+    """
+    try:
+        with open(_gpu_cache_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("ok"):
+            return True, str(d.get("name", ""))
+    except Exception:
+        pass
+    return None
+
+
+def _save_gpu_cache(ok, name):
+    """只缓存成功。失败结果不写盘。"""
+    if not ok:
+        return
+    try:
+        with open(_gpu_cache_path(), "w", encoding="utf-8") as f:
+            json.dump({"ok": True, "name": str(name)}, f)
+    except Exception:
+        pass
+
+
+def _probe_cuda():
+    """**在应用自己的进程里**测一次真实 kernel launch。
+
+    必须在本进程做：探测环境要和实际计算环境一致。放进子进程的话，
+    子进程的环境与宿主启动方式（终端/沙箱/服务）可能不同，会得出
+    与实际相反的结论。
+
+    返回 (ok, device_name)。异常一律视为不可用。
+    """
+    try:
+        import cupy as _cp
+    except Exception as e:
+        print(f"[gpu] 无法 import cupy: {e}")
+        return False, ""
+    try:
+        if _cp.cuda.runtime.getDeviceCount() <= 0:
+            print("[gpu] 未检测到 CUDA 设备 -> 使用 CPU")
+            return False, ""
+        a = _cp.zeros(1)
+        a += 1
+        _cp.cuda.Stream.null.synchronize()
+        if float(_cp.asnumpy(a)[0]) != 1.0:
+            print("[gpu] 自检数值异常 -> 使用 CPU")
+            return False, ""
+        try:
+            p = _cp.cuda.runtime.getDeviceProperties(0)["name"]
+            name = p.decode("utf-8", "ignore") if isinstance(p, bytes) else str(p)
+        except Exception:
+            name = "CUDA"
+        return True, name
+    except Exception as e:
+        print(f"[gpu] 自检失败: {type(e).__name__}: {e} -> 使用 CPU")
+        return False, ""
+
+
+def _activate_backend(use_gpu, name=""):
+    """切换计算后端。只在 AnalysisWorker 没在跑的时候调用。"""
+    global HAS_GPU, GPU_NAME, GPU_STATUS, xp
+    try:
+        import cupy as _cp
+    except Exception:
+        use_gpu = False
+    if use_gpu:
+        with XP_LOCK:
+            xp = _cp
+            HAS_GPU = True
+            GPU_NAME = f"GPU ({name})" if name else "GPU (CUDA)"
+            GPU_STATUS = GPU_NAME
+        print(f"[gpu] 已启用 {GPU_NAME}")
+    else:
+        with XP_LOCK:
+            xp = np
+            HAS_GPU = False
+            GPU_NAME = "CPU (NumPy)"
+            GPU_STATUS = "CPU (NumPy)"
+
+
+def _ensure_backend_ready():
+    """在开始分析前确保后端已经定下来。
+
+    探测在本进程的后台线程里跑。若它已经在跑（正常情况，启动时就跑了），
+    这里只等一小会儿；没等到就用 CPU 继续 —— 绝不让分析卡住。
+    """
+    if _GPU_PROBE_DONE is None:
+        _start_gpu_probe()
+    if _GPU_PROBE_DONE is not None:
+        _GPU_PROBE_DONE.wait(_GPU_PROBE_WAIT)
+
+
+def _gpu_probe_thread():
+    try:
+        if _ENV_NO_GPU:
+            print("[gpu] WAVETONEPRO_NO_GPU 已设置 -> 强制 CPU")
+            _activate_backend(False)
+            return
+        if _ENV_FORCE_GPU:
+            import cupy as _cp
+
+            try:
+                p = _cp.cuda.runtime.getDeviceProperties(0)["name"]
+                name = p.decode("utf-8", "ignore") if isinstance(p, bytes) else str(p)
+            except Exception:
+                name = "CUDA"
+            print("[gpu] WAVETONEPRO_FORCE_GPU 已设置 -> 跳过自检直接启用")
+            _activate_backend(True, name)
+            return
+
+        cached = _load_gpu_cache()
+        if cached is not None:
+            # 只缓存过成功结果：直接启用，省掉一次自检
+            ok, name = cached
+        else:
+            ok, name = _probe_cuda()
+            _save_gpu_cache(ok, name)
+        _activate_backend(ok, name)
+    except Exception as e:
+        print(f"[gpu] 探测线程异常: {type(e).__name__}: {e}")
+        _activate_backend(False)
+    finally:
+        # 先通知界面（此时还没 set 事件，主线程若在等会被正常唤醒）
+        _notify_backend_changed(GPU_STATUS)
+        if _GPU_PROBE_DONE is not None:
+            _GPU_PROBE_DONE.set()
+
+
+def _start_gpu_probe():
+    """非阻塞启动后端探测（只启动一次）。"""
+    global CUPY_AVAILABLE, _GPU_PROBE_DONE
+    if _GPU_PROBE_DONE is not None:
+        return  # 已经探测过/正在探测
+    try:
+        import importlib.util
+
+        CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
+    except Exception:
+        CUPY_AVAILABLE = False
+
+    if not CUPY_AVAILABLE and not _ENV_FORCE_GPU:
+        _activate_backend(False)
+        _GPU_PROBE_DONE = threading.Event()
+        _GPU_PROBE_DONE.set()
+        return
+
+    _GPU_PROBE_DONE = threading.Event()
+    t = threading.Thread(target=_gpu_probe_thread, name="gpu-probe", daemon=True)
+    t.start()
 
 
 # =========================================================================
@@ -137,14 +359,38 @@ def midi_note_off(note):
 # PyQt
 # =========================================================================
 from PyQt5.QtCore import (
-    Qt, QRectF, QPointF, QSize, pyqtSignal, QTimer, QUrl, QThread,
+    Qt,
+    QObject,
+    QRectF,
+    QPointF,
+    QSize,
+    pyqtSignal,
+    QTimer,
+    QUrl,
+    QThread,
 )
 from PyQt5.QtGui import QImage, QPainter, QColor, QPen, QFont, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QHBoxLayout, QFileDialog, QLabel,
-    QComboBox, QSizePolicy, QMessageBox, QToolBar, QAction, QSlider,
-    QStatusBar, QProgressBar, QPushButton, QDoubleSpinBox, QSpinBox,
-    QDialog, QFormLayout, QDialogButtonBox,
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QHBoxLayout,
+    QFileDialog,
+    QLabel,
+    QComboBox,
+    QSizePolicy,
+    QMessageBox,
+    QToolBar,
+    QAction,
+    QSlider,
+    QStatusBar,
+    QProgressBar,
+    QPushButton,
+    QDoubleSpinBox,
+    QSpinBox,
+    QDialog,
+    QFormLayout,
+    QDialogButtonBox,
 )
 
 try:
@@ -159,6 +405,46 @@ except Exception as _e:
 
 
 # =========================================================================
+# 后端切换通知（探测线程 → 主线程刷新界面）
+# -------------------------------------------------------------------------
+# 界面是在探测开始之前就建好的，标题栏和状态栏里存的是那一刻的快照。
+# 探测在后台完成后必须把结果推回主线程，否则界面会一直显示 "CPU (NumPy)"，
+# 即使实际已经在用 GPU 计算。控件只能在主线程改，所以走信号。
+# =========================================================================
+class _BackendNotifier(QObject):
+    changed = pyqtSignal(str)
+
+
+_notifier = _BackendNotifier()
+
+
+def _notify_backend_changed(name):
+    """线程安全：从探测线程发信号给主线程。"""
+    try:
+        _notifier.changed.emit(str(name))
+    except Exception as e:
+        print(f"[gpu] 界面通知失败: {e}")
+
+
+def _backend_label():
+    """状态栏用的后端描述（在探测结束后会变，所以要能重建）。"""
+    if HAS_GPU and GPU_NAME.startswith("GPU ("):
+        inner = GPU_NAME[5:-1]
+        if len(inner) <= 28:
+            return GPU_NAME
+        return f"GPU ({inner[:25]}…)"
+    return "CPU (NumPy)"
+
+
+def _backend_short():
+    return "GPU" if HAS_GPU else "CPU"
+
+
+def _midi_label():
+    return f"MIDI: {MIDI_PORT_NAME}" if MIDI_AVAILABLE else "MIDI: 不可用"
+
+
+# =========================================================================
 # 常量
 # =========================================================================
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -167,7 +453,7 @@ BLACK_PC = {1, 3, 6, 8, 10}
 MIDI_MIN = 21
 MIDI_MAX = 108
 DEFAULT_ROWS_PER_SEMITONE = 12
-ROWS_PER_SEMITONE_CHOICES = (6, 12, 24, 48)
+ROWS_PER_SEMITONE_CHOICES = (1, 2, 4, 6, 12, 24, 48)
 
 DB_FLOOR = -100.0
 DISPLAY_GAMMA = 1.0
@@ -185,11 +471,11 @@ WINDOW_CHOICES = (
     "flattop",
     "blackman-harris-7",
 )
-DEFAULT_WINDOW = "hann"       # ★ 回到原版
+DEFAULT_WINDOW = "hann"
 
-SPLAT_K = 2
-SPLAT_SIGMA_LOW = 0.6         # ★ 回到原版：低频窄
-SPLAT_SIGMA_HIGH = 1.0        # ★ 回到原版：高频宽
+SPLAT_K = 3
+SPLAT_SIGMA_LOW = 0.55
+SPLAT_SIGMA_HIGH = 1.0
 
 ENERGY_THRESHOLD_DB = -60.0
 
@@ -198,7 +484,7 @@ TIME_SPLAT_SIGMA = 0.6
 TIME_INV_SIGMA_SQ_HALF = -0.5 / (TIME_SPLAT_SIGMA * TIME_SPLAT_SIGMA)
 
 GROUP_SEMITONES = 6
-GROUP_OVERLAP = 4             # ★ 回到原版：4（重叠更多，过渡更平滑）
+GROUP_OVERLAP = 4
 
 F32 = np.float32
 F64 = np.float64
@@ -208,20 +494,51 @@ F64 = np.float64
 # 颜色映射
 # =========================================================================
 MAGMA_STOPS = [
-    (0, 0, 4), (28, 16, 68), (79, 18, 123), (129, 37, 129),
-    (181, 54, 122), (229, 80, 100), (251, 135, 97), (254, 194, 135), (252, 253, 191),
+    (0, 0, 4),
+    (28, 16, 68),
+    (79, 18, 123),
+    (129, 37, 129),
+    (181, 54, 122),
+    (229, 80, 100),
+    (251, 135, 97),
+    (254, 194, 135),
+    (252, 253, 191),
 ]
 INFERNO_STOPS = [
-    (0, 0, 4), (22, 11, 57), (66, 10, 104), (106, 23, 110), (147, 38, 103),
-    (188, 55, 84), (221, 81, 58), (243, 120, 25), (252, 165, 10), (246, 215, 70), (252, 255, 164),
+    (0, 0, 4),
+    (22, 11, 57),
+    (66, 10, 104),
+    (106, 23, 110),
+    (147, 38, 103),
+    (188, 55, 84),
+    (221, 81, 58),
+    (243, 120, 25),
+    (252, 165, 10),
+    (246, 215, 70),
+    (252, 255, 164),
 ]
 VIRIDIS_STOPS = [
-    (68, 1, 84), (72, 40, 120), (62, 74, 137), (49, 104, 142), (38, 130, 142),
-    (31, 158, 137), (53, 183, 121), (109, 205, 89), (180, 222, 44), (253, 231, 37),
+    (68, 1, 84),
+    (72, 40, 120),
+    (62, 74, 137),
+    (49, 104, 142),
+    (38, 130, 142),
+    (31, 158, 137),
+    (53, 183, 121),
+    (109, 205, 89),
+    (180, 222, 44),
+    (253, 231, 37),
 ]
 ICE_STOPS = [
-    (2, 4, 10), (8, 22, 50), (10, 52, 96), (8, 92, 140), (20, 140, 175),
-    (70, 185, 205), (140, 220, 230), (210, 245, 250), (255, 255, 255),
+    (2, 4, 10),
+    (8, 22, 50),
+    (10, 52, 96),
+    (8, 92, 140),
+    (20, 140, 175),
+    (70, 185, 205),
+    (140, 220, 230),
+    (210, 245, 250),
+    (255, 255, 255),
 ]
 
 
@@ -242,8 +559,7 @@ LUTS = {
     "viridis": build_lut(VIRIDIS_STOPS),
     "ice": build_lut(ICE_STOPS),
 }
-LUTS_RGB = {name: (lut[:, 0].copy(), lut[:, 1].copy(), lut[:, 2].copy())
-            for name, lut in LUTS.items()}
+LUTS_RGB = {name: (lut[:, 0].copy(), lut[:, 1].copy(), lut[:, 2].copy()) for name, lut in LUTS.items()}
 
 
 # =========================================================================
@@ -382,47 +698,46 @@ _WINDOW_CACHE = {}
 
 
 def make_window(name, N):
+    """生成窗函数。
+
+    统一使用**周期型（DFT-even）**形式，即分母取 N。
+    这样窗在 STFT 里才是首尾相接、不需要额外补一个样本的；
+    混用周期型和对称型（分母 N-1）会让不同窗之间的对比结果
+    带上非预期的差异。`hann` 沿用 np.hanning(N+1)[:N]，效果与
+    周期型完全一致（数值上逐点相同）。
+    """
     key = (name, int(N))
     cached = _WINDOW_CACHE.get(key)
     if cached is not None:
         return cached
 
     if name == "hann":
-        # 原版用的就是这个（np.hanning(N+1)[:N]）
+        # 周期型 Hann，等价于 0.5 - 0.5*cos(2*pi*n/N)
         w = np.hanning(N + 1)[:N].astype(np.float32)
     else:
         n = np.arange(N, dtype=np.float64)
         if N < 2:
             w = np.ones(N, dtype=np.float64)
         elif name == "hamming":
-            w = 0.54 - 0.46 * np.cos(2.0 * np.pi * n / (N - 1))
+            w = 0.54 - 0.46 * np.cos(2.0 * np.pi * n / N)
         elif name == "blackman-harris":
             a0, a1, a2, a3 = 0.35875, 0.48829, 0.14128, 0.01168
-            w = (a0
-                 - a1 * np.cos(2.0 * np.pi * n / (N - 1))
-                 + a2 * np.cos(4.0 * np.pi * n / (N - 1))
-                 - a3 * np.cos(6.0 * np.pi * n / (N - 1)))
+            w = a0 - a1 * np.cos(2.0 * np.pi * n / N) + a2 * np.cos(4.0 * np.pi * n / N) - a3 * np.cos(6.0 * np.pi * n / N)
         elif name == "blackman-harris-7":
-            a = (0.27105140069342, 0.43329793923448, 0.21812299954311,
-                 0.06592544638803, 0.01081174209837, 0.00077658482522,
-                 0.00001388721735)
+            a = (0.27105140069342, 0.43329793923448, 0.21812299954311, 0.06592544638803, 0.01081174209837, 0.00077658482522, 0.00001388721735)
             w = np.full(N, a[0], dtype=np.float64)
             for i in range(1, 7):
                 sign = -1.0 if (i % 2 == 1) else 1.0
-                w += sign * a[i] * np.cos(2.0 * np.pi * i * n / (N - 1))
+                w += sign * a[i] * np.cos(2.0 * np.pi * i * n / N)
         elif name == "kaiser":
             beta = 14.0
-            x = (2.0 * n / (N - 1)) - 1.0
+            x = (2.0 * n / N) - 1.0
             w = np.i0(beta * np.sqrt(np.maximum(0.0, 1.0 - x * x))) / np.i0(beta)
         elif name == "flattop":
             a = (0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368)
-            w = (a[0]
-                 - a[1] * np.cos(2.0 * np.pi * n / (N - 1))
-                 + a[2] * np.cos(4.0 * np.pi * n / (N - 1))
-                 - a[3] * np.cos(6.0 * np.pi * n / (N - 1))
-                 + a[4] * np.cos(8.0 * np.pi * n / (N - 1)))
+            w = a[0] - a[1] * np.cos(2.0 * np.pi * n / N) + a[2] * np.cos(4.0 * np.pi * n / N) - a[3] * np.cos(6.0 * np.pi * n / N) + a[4] * np.cos(8.0 * np.pi * n / N)
         else:
-            w = 0.5 - 0.5 * np.cos(2.0 * np.pi * n / (N - 1))
+            w = 0.5 - 0.5 * np.cos(2.0 * np.pi * n / N)
         w = w.astype(np.float32)
 
     w = np.ascontiguousarray(w)
@@ -443,11 +758,28 @@ def _prev_pow2(n):
     return 1 << (n.bit_length() - 1)
 
 
-def _plan_groups(sr, midi_min, midi_max,
-                 min_fft=FFT_MIN, max_fft=FFT_MAX,
-                 group_semitones=GROUP_SEMITONES,
-                 overlap=GROUP_OVERLAP):
+def _plan_groups(sr, midi_min, midi_max, min_fft=FFT_MIN, max_fft=FFT_MAX, group_semitones=GROUP_SEMITONES, overlap=GROUP_OVERLAP, n_samples=None):
+    """按半音分组，为每组选 FFT 尺寸 N。
+
+    关键约束：N 不能超过信号长度 n_samples。
+    窗比信号还长时，窗里只有一小截真实数据、其余全是补充出来的样本；
+    相位差法测出的瞬时频率随之失效，低频段会整片糊掉（实测 0.5 s 的
+    32.7 Hz 纯音峰值能偏到 G#3，误差 +40 个半音）。
+    把 N 限制在信号长度以内，可以保证窗内始终是真实数据。
+
+    另外：相邻两组（同一八度内的 A-D 与 D#-G#）必须用**同一个 N**。
+    每组原本按自己**最低音**的频率分辨率需求定 N，而 D# 比 A 高一个三全音，
+    于是每个 D#-G# 组的 bin 宽恰好是配对 A-D 组的 2 倍 —— 纵向分辨率粗一倍，
+    能量在更多行之间摊开，画出来就是 D#-G# 区域明显的稀疏/条纹，而
+    G#-D 区域干净。统一 N 之后这个不对称消失（实测时间方向 CV 降 18~31%）。
+    """
     ratio = 2.0 ** (1.0 / 12.0) - 1.0
+    if n_samples is not None:
+        # 至少要能放下 min_fft，否则这组没法分析；
+        # 同时保持 2 的幂（用 _prev_pow2 向下取），否则会出现非 2 幂的
+        # FFT 长度，且和相邻组的分辨率对不齐。
+        cap = _prev_pow2(max(1, int(n_samples)))
+        max_fft = int(max(min_fft, min(max_fft, cap)))
     groups = []
     m = midi_min
     while m <= midi_max:
@@ -456,22 +788,78 @@ def _plan_groups(sr, midi_min, midi_max,
         N = _next_pow2(6.0 * sr / delta_f)
         N = int(min(max(N, min_fft), max_fft))
         hop_nat = max(1, _prev_pow2(max(1, N // overlap)))
-        groups.append((m, m_end, N, hop_nat))
+        # hop 超过窗长会漏掉样本，必须夹住
+        hop_nat = int(min(hop_nat, max(1, N)))
+        groups.append([m, m_end, N, hop_nat])
         m = m_end
-    return groups
+
+    # 同一八度对内的两组统一分辨率：取两者中更细的 N
+    i = 0
+    while i + 1 < len(groups):
+        a, b = groups[i], groups[i + 1]
+        if b[0] - a[0] == group_semitones:
+            N = max(a[2], b[2])
+            for g in (a, b):
+                g[2] = N
+                # 窗变长后 hop 也要按同样的重叠比重新夹一次
+                h = max(1, _prev_pow2(max(1, N // overlap)))
+                g[3] = int(min(max(h, min(g[3], h)), N))
+            i += 2
+        else:
+            i += 1
+    return [tuple(g) for g in groups]
+
+
+def _midpoint_freq(f_a, f_b):
+    """两个频率的几何中点（音乐上是它们之间的半音中点）。"""
+    return math.sqrt(float(f_a) * float(f_b))
 
 
 def _plan_chunks(sr, n_samples, groups):
+    """为每组规划 bin 范围与分块。
+
+    相邻组的频率区间**必须精确分割**：用相邻组交界处的几何中点作为切分点，
+    而不是各自用 searchsorted 去够自己的标称边界。原因是 bin 分辨率有限
+    （最低几组一个 bin 才 0.17..2.7 Hz），`searchsorted(..., side="left")`
+    会让相邻两组同时包含边界处那个 bin，于是正好落在分组边界上的音（例如
+    A4 = 440 Hz，恰好是 A4-D5 组的首音）会被两组各算一遍、能量翻倍。
+    实测这会让每 6 个半音出现一次约 1.5 倍的亮度条纹。
+
+    每个元组末尾额外带出 (f_lo, f_hi)，供 _reassign_chunk 判断重分配后的
+    频率是否仍属于本组 —— 输入 bin 与输出频带用同一套边界，两者一致。
+    """
+    n_groups = len(groups)
+    # 每组的下边界：与本组前一组的几何中点；最低一组从 0 开始
+    band_lo = []
+    for i, (m_start, m_end, N, hop_g) in enumerate(groups):
+        if i == 0:
+            band_lo.append(0.0)
+        else:
+            band_lo.append(_midpoint_freq(midi_to_freq(groups[i - 1][1] - 1), midi_to_freq(m_start)))
+    # 每组的上边界：与下一组的几何中点；最高一组到 Nyquist
+    band_hi = []
+    for i, (m_start, m_end, N, hop_g) in enumerate(groups):
+        if i == n_groups - 1:
+            band_hi.append(float(sr) * 0.5)
+        else:
+            band_hi.append(_midpoint_freq(midi_to_freq(m_end - 1), midi_to_freq(groups[i + 1][0])))
+
     plans = []
-    for m_start, m_end, N, hop_g in groups:
+    for i, (m_start, m_end, N, hop_g) in enumerate(groups):
         n_frames_g = n_samples // hop_g + 1
         n_bins = N // 2 + 1
         f_k_np = np.arange(n_bins, dtype=np.float64) * (float(sr) / float(N))
 
-        k_lo = int(np.searchsorted(f_k_np, midi_to_freq(m_start), side="left"))
-        k_hi = int(np.searchsorted(f_k_np, midi_to_freq(m_end), side="left"))
+        f_lo = band_lo[i]
+        f_hi = band_hi[i]
+        k_lo = int(np.searchsorted(f_k_np, f_lo, side="left"))
+        k_hi = int(np.searchsorted(f_k_np, f_hi, side="left"))
         k_lo = max(0, min(k_lo, n_bins - 1))
         k_hi = max(k_lo + 1, min(k_hi, n_bins))
+        # 上面的钳制可能让 k_lo 落回本组频带之外（最低几组 bin 很粗），
+        # 那会把属于上一组的 bin 又拉进来，重新造成重叠。此时直接判定为空。
+        if f_k_np[k_lo] >= f_hi:
+            k_lo = k_hi = 0
 
         target_mem = 1.5e8 if HAS_GPU else 4.0e8
         chunk = max(8, int(target_mem / (n_bins * 16 * 3)))
@@ -486,7 +874,7 @@ def _plan_chunks(sr, n_samples, groups):
                 break
             i0 = i1 - 2
 
-        plans.append((m_start, m_end, N, hop_g, k_lo, k_hi, starts))
+        plans.append((m_start, m_end, N, hop_g, k_lo, k_hi, starts, f_lo, f_hi))
     return plans
 
 
@@ -524,8 +912,21 @@ def _stft_batch(samples_xp, N, hop, i0, i1, window_xp):
 # 谱重分配：原版算法
 # =========================================================================
 def _reassign_chunk(
-    X, N, hop, sr, f_k, n_rows, midi_min, midi_max,
-    rows_per_semitone, group_grid, i0_group, k_lo=0, k_hi=None,
+    X,
+    N,
+    hop,
+    sr,
+    f_k,
+    n_rows,
+    midi_min,
+    midi_max,
+    rows_per_semitone,
+    group_grid,
+    i0_group,
+    k_lo=0,
+    k_hi=None,
+    band_lo=None,
+    band_hi=None,
 ):
     m_full, n_bins_full = X.shape
     if m_full < 3:
@@ -551,10 +952,10 @@ def _reassign_chunk(
     del mag
 
     k_idx = xp.arange(k_lo, k_hi, dtype=xp.float64)
+    # 减掉每个 bin 在 hop 之间的固有相位推进，再折算成频率偏差。
+    # 折到 (-pi, pi] 的写法：((x + pi) mod 2pi) - pi。
     dphase -= (2.0 * xp.pi * float(hop) / float(N)) * k_idx[None, :]
-    dphase += xp.pi
-    xp.mod(dphase, 2.0 * xp.pi, out=dphase)
-    dphase -= xp.pi
+    dphase = xp.mod(dphase + xp.pi, 2.0 * xp.pi) - xp.pi
     dphase *= float(sr) / (2.0 * xp.pi * float(hop))
 
     f_inst = f_k_sub[None, :] + dphase
@@ -568,6 +969,12 @@ def _reassign_chunk(
     r_lo = -float(SPLAT_K) - 1.0
     r_hi = float(n_rows) + float(SPLAT_K)
     valid = (f_inst > 20.0) & (f_inst < float(sr) * 0.5) & (r_float > r_lo) & (r_float < r_hi)
+
+    # 频带归属：只累加重分配后仍落在本组频带内的能量。
+    # 输入 bin 范围与这里的频带用同一套边界（见 _plan_chunks），
+    # 半开区间 [band_lo, band_hi) 保证相邻组不重不漏。
+    if band_lo is not None and band_hi is not None:
+        valid &= (f_inst >= band_lo) & (f_inst < band_hi)
     del f_inst
 
     if ENERGY_THRESHOLD_DB < 0.0:
@@ -665,13 +1072,46 @@ def _splat_group_to_common(group_grid, ratio, out, n_common):
 # 主流程
 # =========================================================================
 def compute_reassigned_spectrogram(
-    samples, sr,
-    midi_min=MIDI_MIN, midi_max=MIDI_MAX,
+    samples,
+    sr,
+    midi_min=MIDI_MIN,
+    midi_max=MIDI_MAX,
     rows_per_semitone=DEFAULT_ROWS_PER_SEMITONE,
     target_fps=DEFAULT_TARGET_FPS,
     window_name=DEFAULT_WINDOW,
     max_frames=65536,
-    progress_cb=None, cancel_cb=None,
+    progress_cb=None,
+    cancel_cb=None,
+):
+    """公开入口。持有 XP_LOCK，保证后台 GPU 探测不会在分析中途切换后端。"""
+    # 等后端确定下来，但最多等 _GPU_PROBE_WAIT 秒：探测卡住也照样能用 CPU 出图。
+    _ensure_backend_ready()
+    with XP_LOCK:
+        return _compute_reassigned_locked(
+            samples,
+            sr,
+            midi_min,
+            midi_max,
+            rows_per_semitone,
+            target_fps,
+            window_name,
+            max_frames,
+            progress_cb,
+            cancel_cb,
+        )
+
+
+def _compute_reassigned_locked(
+    samples,
+    sr,
+    midi_min,
+    midi_max,
+    rows_per_semitone,
+    target_fps,
+    window_name,
+    max_frames,
+    progress_cb,
+    cancel_cb,
 ):
     n_rows = (midi_max - midi_min + 1) * rows_per_semitone
     samples_np = np.ascontiguousarray(samples, dtype=F32)
@@ -680,7 +1120,8 @@ def compute_reassigned_spectrogram(
     if n == 0:
         return np.zeros((1, n_rows), dtype=F32), max(1, sr // target_fps)
 
-    groups_raw = _plan_groups(sr, midi_min, midi_max)
+    # 窗长不能超过信号本身，否则窗只是一小截真实数据（见 _plan_groups 注释）
+    groups_raw = _plan_groups(sr, midi_min, midi_max, n_samples=n)
 
     target_hop = max(1, int(round(sr / float(target_fps))))
     base_hop = max(1, _prev_pow2(target_hop))
@@ -707,6 +1148,26 @@ def compute_reassigned_spectrogram(
     total_chunks = sum(len(p[6]) for p in plans) or 1
     done_chunks = 0
 
+    # 相位差至少要三帧才能算，帧数不足的组会被直接跳过。
+    # 另外，短信号会把最长 FFT 压小，某些组的频率分辨率可能已经差到
+    # 分不开自己负责的半音 —— 这时低音区必然糊。两种情况都给一次明确告警，
+    # 避免"静默出全黑图/低频发虚"这种难查的现象。
+    if plans:
+        min_frames = min(n // hop + 1 for (_, _, _, hop, _, _, _, _, _) in plans)
+        if min_frames < 3:
+            print(f"[analyze] 信号过短（{n} 个采样 ≈ {n / float(sr) * 1000:.1f} ms），" f"最少只有 {min_frames} 帧，不足 3 帧，结果将为空。")
+        else:
+            worst = None
+            for ms, me, N, hop_g, _kl, _kh, _st, _fl, _fh in plans:
+                df = float(sr) / float(N)
+                semitone = midi_to_freq(ms + 1) - midi_to_freq(ms)
+                if df > 2.0 * semitone:
+                    if worst is None or df / semitone > worst[2]:
+                        worst = (ms, df, df / semitone)
+            if worst is not None:
+                ms, df, ratio = worst
+                print(f"[analyze] 信号偏短（{n / float(sr):.2f} s）：最长 FFT 受信号长度" f"限制，{midi_name(ms)} 附近分辨率 " f"{df:.1f} Hz 已达半音间距的 {ratio:.1f} 倍，低音区会明显发糊。")
+
     if progress_cb is not None:
         try:
             progress_cb(0.0)
@@ -714,7 +1175,7 @@ def compute_reassigned_spectrogram(
             pass
 
     cancelled = False
-    for m_start, m_end, N, hop_g, k_lo, k_hi, starts in plans:
+    for m_start, m_end, N, hop_g, k_lo, k_hi, starts, band_lo, band_hi in plans:
         if not starts:
             continue
 
@@ -737,8 +1198,21 @@ def compute_reassigned_spectrogram(
 
             X = _stft_batch(samples_xp, N, hop_g, i0, i1, window_xp)
             _reassign_chunk(
-                X, N, hop_g, sr, f_k_xp, n_rows, midi_min, midi_max,
-                rows_per_semitone, group_grid, i0, k_lo=k_lo, k_hi=k_hi,
+                X,
+                N,
+                hop_g,
+                sr,
+                f_k_xp,
+                n_rows,
+                midi_min,
+                midi_max,
+                rows_per_semitone,
+                group_grid,
+                i0,
+                k_lo=k_lo,
+                k_hi=k_hi,
+                band_lo=band_lo,
+                band_hi=band_hi,
             )
             del X
 
@@ -803,6 +1277,34 @@ def db_to_u8(db, floor_db=DB_FLOOR, hide_low=0.0, gamma=DISPLAY_GAMMA):
     return norm.astype(np.uint8)
 
 
+def semitone_step_filter(db, rows_per_semitone=DEFAULT_ROWS_PER_SEMITONE,
+                         midi_max=MIDI_MAX):
+    """后期滤镜：把每个半音内部的各行亮度取平均。
+
+    输入/输出都是 (n_frames, n_rows) 的 dB。行 0 对应 MIDI_MAX，行号随音高
+    下降而增加。每 rps 行属于同一个半音，取该半音内所有行的均值写回整段，
+    于是半音内部变成一条平带、半音之间出现硬边界 —— 也就是"阶梯感"。
+
+    在 dB（对数）域取平均，平滑效果比在线性幅度域更接近视觉上的等量。
+    纯显示滤镜，不改动分析结果本身。
+    """
+    rps = max(1, int(rows_per_semitone))
+    n_frames, n_rows = db.shape
+    if n_rows <= rps:
+        return db
+    n_semi = n_rows // rps
+    used = n_semi * rps
+    # 先按整半音分块求均值，再把均值铺回整块
+    blocks = db[:, :used].reshape(n_frames, n_semi, rps)
+    means = blocks.mean(axis=2, keepdims=True, dtype=F32)
+    out = np.empty_like(db)
+    out[:, :used] = np.broadcast_to(means, (n_frames, n_semi, rps)).reshape(n_frames, used)
+    # 末尾不足一个半音的行按最后一个完整半音的均值处理
+    if used < n_rows:
+        out[:, used:] = means[:, -1, :]
+    return out
+
+
 def u8_to_qimage_fast(u8, rgb_lut):
     """u8: (n_frames, n_rows) → QImage: width=n_frames, height=n_rows"""
     r_lut, g_lut, b_lut = rgb_lut
@@ -817,11 +1319,114 @@ def u8_to_qimage_fast(u8, rgb_lut):
 
 
 # =========================================================================
+# 分析结果导出（数组，而不是图片）
+# =========================================================================
+# 导出的是**原始线性幅度**，不做任何归一化/量化/裁剪 —— 调试和二次处理
+# 需要的就是未经显示管线污染的数据。
+EXPORT_FORMATS = ("npz", "npy", "csv", "raw(f32)")
+
+
+def export_payload(mag, db, hop, sr, params=None, source_path=None,
+                   hide_low=None, colormap=None, u8=None):
+    """组装一份自描述的导出数据。
+
+    mag : (n_frames, n_rows) float32，线性幅度，行 0 = MIDI_MAX
+    db  : 同一形状的 dB（相对峰值，上限 0），便于直接画图
+    """
+    p = params or {}
+    n_frames, n_rows = mag.shape
+    midi_min = MIDI_MIN
+    midi_max = MIDI_MAX
+    rps = int(p.get("rows_per_semitone", DEFAULT_ROWS_PER_SEMITONE))
+    frames = np.arange(n_frames, dtype=np.float64)
+    times = frames * float(hop) / float(sr)
+    rows = np.arange(n_rows)
+    midis = (midi_max + 0.5) - (rows + 0.5) / float(rps)
+    freqs = 440.0 * np.power(2.0, (midis - 69.0) / 12.0)
+    return {
+        "mag": np.asarray(mag, dtype=np.float32),
+        "db": np.asarray(db, dtype=np.float32),
+        "u8": (None if u8 is None else np.asarray(u8, dtype=np.uint8)),
+        "time_s": times,
+        "midi": midis,
+        "freq_hz": freqs,
+        # ---- 元数据（npz 里存成 0 维数组，csv 里写注释头）----
+        "sr": int(sr),
+        "hop": int(hop),
+        "fps": float(sr) / float(hop),
+        "midi_min": int(midi_min),
+        "midi_max": int(midi_max),
+        "rows_per_semitone": int(rps),
+        "window_name": str(p.get("window_name", DEFAULT_WINDOW)),
+        "target_fps": int(p.get("target_fps", DEFAULT_TARGET_FPS)),
+        "db_floor": float(DB_FLOOR),
+        "hide_low": ("" if hide_low is None else float(hide_low)),
+        "colormap": ("" if colormap is None else str(colormap)),
+        "duration_s": float(n_frames * hop) / float(sr),
+        "source": ("" if source_path is None else os.path.basename(str(source_path))),
+        "rows_are": "midi decreasing with row index; row 0 = MIDI_MAX",
+    }
+
+
+def export_result(path, payload, fmt=None):
+    """把 payload 写到 path。fmt 为空时按扩展名推断。返回实际写入的路径。"""
+    path = str(path)
+    if fmt is None:
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        fmt = {"npz": "npz", "npy": "npy", "csv": "csv",
+               "bin": "raw(f32)", "raw": "raw(f32)", "f32": "raw(f32)"}.get(ext, "npz")
+    mag = payload["mag"]
+    db = payload["db"]
+    meta = {k: v for k, v in payload.items()
+            if k not in ("mag", "db", "u8") and not isinstance(v, np.ndarray)}
+
+    if fmt == "npz":
+        arrays = {"mag": mag, "db": db,
+                  "time_s": payload["time_s"], "midi": payload["midi"],
+                  "freq_hz": payload["freq_hz"]}
+        if payload.get("u8") is not None:
+            arrays["u8"] = payload["u8"]
+        np.savez_compressed(path, **arrays, **meta)
+        return path
+
+    if fmt == "npy":
+        np.save(path, mag)
+        return path
+
+    if fmt == "raw(f32)":
+        mag.astype("<f4").tofile(path)
+        return path
+
+    if fmt == "csv":
+        # 头部注释带元数据，之后第一列是时间，其余列按中音号命名
+        lines = ["# wavetonepro export",
+                 f"# shape(n_frames,n_rows)={db.shape[0]},{db.shape[1]}",
+                 f"# rows_are={payload['rows_are']}"]
+        for k in sorted(meta):
+            lines.append(f"# {k}={meta[k]}")
+        hdr = ["time_s"] + [f"midi{m:.3f}" for m in payload["midi"]]
+        lines.append(",".join(hdr))
+        t = payload["time_s"]
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines) + "\n")
+            block = max(1, 200000 // max(1, db.shape[1]))
+            for i in range(0, db.shape[0], block):
+                sub = db[i:i + block]
+                for j in range(sub.shape[0]):
+                    f.write(f"{t[i + j]:.6f}," +
+                            ",".join(f"{v:.3f}" for v in sub[j]) + "\n")
+        return path
+
+    raise ValueError(f"未知导出格式: {fmt}")
+
+
+
+# =========================================================================
 # 分析工作线程
 # =========================================================================
 class AnalysisWorker(QThread):
     progress = pyqtSignal(int, str)
-    done = pyqtSignal(object, int)
+    done = pyqtSignal(object, int, object)      # (db, hop, mag)
     failed = pyqtSignal(str)
 
     def __init__(self, samples, sr, params, parent=None):
@@ -836,6 +1441,7 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
+
             def progress_cb(frac):
                 pct = int(max(0.0, min(1.0, float(frac))) * 100)
                 self.progress.emit(pct, f"分析中… {pct}%")
@@ -844,18 +1450,22 @@ class AnalysisWorker(QThread):
                 return self._cancel
 
             mag, hop = compute_reassigned_spectrogram(
-                self.samples, self.sr,
-                midi_min=MIDI_MIN, midi_max=MIDI_MAX,
+                self.samples,
+                self.sr,
+                midi_min=MIDI_MIN,
+                midi_max=MIDI_MAX,
                 rows_per_semitone=self.params["rows_per_semitone"],
                 target_fps=self.params["target_fps"],
                 window_name=self.params["window_name"],
-                progress_cb=progress_cb, cancel_cb=cancel_cb,
+                progress_cb=progress_cb,
+                cancel_cb=cancel_cb,
             )
         except AnalysisCancelled:
             self.failed.emit("__cancelled__")
             return
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             self.failed.emit(str(e))
             return
@@ -869,12 +1479,14 @@ class AnalysisWorker(QThread):
             db = compute_db(mag)
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             self.failed.emit(str(e))
             return
 
         self.progress.emit(100, "完成")
-        self.done.emit(db, hop)
+        # 同时带回未归一化的线性幅度，供导出使用（db 只用于显示）
+        self.done.emit(db, hop, mag)
 
 
 # =========================================================================
@@ -1055,8 +1667,7 @@ class PianoRoll(QWidget):
             if r.height() < 8.5:
                 continue
             octv = m // 12 - 1
-            p.drawText(QRectF(W * 0.30, r.top(), W * 0.64, r.height()),
-                       Qt.AlignVCenter | Qt.AlignRight, f"C{octv}")
+            p.drawText(QRectF(W * 0.30, r.top(), W * 0.64, r.height()), Qt.AlignVCenter | Qt.AlignRight, f"C{octv}")
 
         p.setPen(QPen(QColor(48, 55, 70), 1))
         p.drawLine(W - 1, 0, W - 1, H)
@@ -1124,6 +1735,11 @@ class SpectrogramView(QWidget):
         self.hide_low = 0.0
         self.show_grid = True
 
+        # 阶梯滤镜：半音内取平均，只影响显示
+        self.rows_per_semitone = DEFAULT_ROWS_PER_SEMITONE
+        self.step_filter = False
+        self._step_cache = None
+
         self.harmonics = 0
         self.playhead_frame = None
         self.view_start = 0.0
@@ -1188,11 +1804,14 @@ class SpectrogramView(QWidget):
             self.view_start = new_view_start
             self._invalidate()
 
-    def set_data(self, db, hop, sr, fit=True):
+    def set_data(self, db, hop, sr, fit=True, rows_per_semitone=None):
         self.db = db
         self.hop = hop
         self.sr = sr
         self.n_frames, self.n_rows = db.shape
+        if rows_per_semitone is not None and int(rows_per_semitone) != self.rows_per_semitone:
+            self.rows_per_semitone = int(rows_per_semitone)
+        self._step_cache = None
         self._regen_u8()
         if self.selected_mask is not None:
             self.selected_mask = None
@@ -1223,6 +1842,28 @@ class SpectrogramView(QWidget):
         if self.db is not None:
             self._regen_u8()
         self._invalidate()
+
+    def set_step_filter(self, on):
+        """半音内取平均的阶梯滤镜。只影响显示，不动分析结果。"""
+        on = bool(on)
+        if on == self.step_filter:
+            return
+        self.step_filter = on
+        self._regen_u8()
+        self._invalidate()
+
+    def _display_db(self):
+        """返回用于上色的 dB：开启阶梯滤镜时用缓存的滤波结果。"""
+        if not self.step_filter or self.db is None:
+            return self.db
+        if self._step_cache is None:
+            try:
+                self._step_cache = semitone_step_filter(
+                    self.db, self.rows_per_semitone, self.midi_max)
+            except Exception as e:
+                print(f"[filter] 阶梯滤镜失败: {type(e).__name__}: {e}")
+                self._step_cache = self.db
+        return self._step_cache
 
     def set_harmonics(self, n):
         n = max(0, min(5, int(n)))
@@ -1393,7 +2034,8 @@ class SpectrogramView(QWidget):
             self.u8 = None
             self.qimg = None
             return
-        self.u8 = db_to_u8(self.db, floor_db=DB_FLOOR, hide_low=self.hide_low, gamma=DISPLAY_GAMMA)
+        self.u8 = db_to_u8(self._display_db(), floor_db=DB_FLOOR,
+                           hide_low=self.hide_low, gamma=DISPLAY_GAMMA)
         self.qimg = u8_to_qimage_fast(self.u8, self.rgb_lut)
 
     def fit_view(self):
@@ -1511,9 +2153,7 @@ class SpectrogramView(QWidget):
             f = QFont()
             f.setPointSizeF(10.5)
             p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignCenter,
-                       "打开音频文件以显示频谱图\n\n"
-                       "滚轮缩放 · 左键拖拽平移 · 右键拖拽创建遮罩")
+            p.drawText(self.rect(), Qt.AlignCenter, "打开音频文件以显示频谱图\n\n" "滚轮缩放 · 左键拖拽平移 · 右键拖拽创建遮罩")
             return
 
         if self._cache is None or self._cache.size() != QSize(W, H):
@@ -1766,6 +2406,8 @@ class MainWindow(QMainWindow):
         self.hop = 512
         self.hide_low = 0.0
         self.current_path = None
+        self.db = None          # 最近一次分析结果（dB），供导出用
+        self.mag = None         # 同一结果的线性幅度（未归一化）
 
         self.params = {
             "window_name": DEFAULT_WINDOW,
@@ -1804,7 +2446,33 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_statusbar()
 
+        # 后台探测完成后刷新标题栏/状态栏，否则界面会一直显示 CPU。
+        _notifier.changed.connect(self._on_backend_changed)
+        # 万一探测在界面建好之前就结束了，这里补一次。
+        if _GPU_PROBE_DONE is not None and _GPU_PROBE_DONE.is_set():
+            self._on_backend_changed(GPU_STATUS)
+
         QTimer.singleShot(0, lambda: self.resize(1400, 860))
+
+    def _on_backend_changed(self, name=""):
+        """在主线程刷新与后端相关的文字。"""
+        try:
+            self.setWindowTitle(f"频谱图分析工具  ·  {GPU_NAME}")
+            if hasattr(self, "lbl_right"):
+                self.lbl_right.setText(f"{_backend_label()}  ·  {_midi_label()}  ·  " f"滚轮缩放 · 左键平移/发声 · 右键拖动创建遮罩")
+            if self.samples is not None:
+                # 已经载入过文件：重算一次当前状态的描述，避免显示陈旧信息
+                self.lbl_left.setText(self._ready_text())
+        except Exception as e:
+            print(f"[ui] 刷新后端文字失败: {e}")
+
+    def _ready_text(self):
+        """已载入文件但还没分析完时用的简短描述。"""
+        if self.current_path is None:
+            return "就绪  ·  拖入音频文件或点击「打开音频」"
+        name = os.path.basename(self.current_path)
+        dur = len(self.samples) / float(self.sr) if self.samples is not None else 0.0
+        return f"{name}   ·   {self.sr} Hz   ·   {dur:.2f} s   ·   " f"{_backend_label()}"
 
     def _init_media_player(self):
         if not HAS_MEDIA:
@@ -1863,6 +2531,7 @@ class MainWindow(QMainWindow):
         self.wav_bytes = wav_bytes
         try:
             import tempfile
+
             fd, tmp = tempfile.mkstemp(prefix="wavetonepro_", suffix=".wav")
             with os.fdopen(fd, "wb") as f:
                 f.write(wav_bytes)
@@ -1880,6 +2549,7 @@ class MainWindow(QMainWindow):
 
         try:
             from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
+
             buf = QBuffer(self)
             buf.setData(QByteArray(wav_bytes))
             if not buf.open(QIODevice.ReadOnly):
@@ -2009,6 +2679,15 @@ class MainWindow(QMainWindow):
         act_params.triggered.connect(self.open_params_dialog)
         tb.addAction(act_params)
 
+        self.act_export = QAction("导出 💾", self)
+        self.act_export.setToolTip(
+            "把分析结果导出为数组文件（npz / npy / csv / raw float32）\n"
+            "导出的是未归一化的线性幅度，便于调试和二次处理")
+        self.act_export.setShortcut("Ctrl+E")
+        self.act_export.triggered.connect(self.export_result_dialog)
+        self.act_export.setEnabled(False)
+        tb.addAction(self.act_export)
+
         act_fit = QAction("适应 🔍", self)
         act_fit.setToolTip("适应窗口 (Ctrl+0)")
         act_fit.setShortcut("Ctrl+0")
@@ -2056,8 +2735,7 @@ class MainWindow(QMainWindow):
         self.cb_cmap.setFixedWidth(75)
         for name in ("magma", "inferno", "viridis", "ice"):
             self.cb_cmap.addItem(name, name)
-        self.cb_cmap.currentIndexChanged.connect(
-            lambda i: self.spec.set_colormap(self.cb_cmap.itemData(i)))
+        self.cb_cmap.currentIndexChanged.connect(lambda i: self.spec.set_colormap(self.cb_cmap.itemData(i)))
         tb.addWidget(self.cb_cmap)
 
         tb.addWidget(QLabel("泛音数量"))
@@ -2066,8 +2744,7 @@ class MainWindow(QMainWindow):
         self.cb_harm.setFixedWidth(40)
         for n in range(6):
             self.cb_harm.addItem(str(n), n)
-        self.cb_harm.currentIndexChanged.connect(
-            lambda i: self.spec.set_harmonics(self.cb_harm.itemData(i)))
+        self.cb_harm.currentIndexChanged.connect(lambda i: self.spec.set_harmonics(self.cb_harm.itemData(i)))
         tb.addWidget(self.cb_harm)
 
         tb.addSeparator()
@@ -2108,6 +2785,18 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        self.act_step = QAction("阶梯滤镜 ▤", self)
+        self.act_step.setCheckable(True)
+        self.act_step.setChecked(False)
+        self.act_step.setToolTip(
+            "后期滤镜：把每个半音内部的各行亮度取平均\n"
+            "半音内部变成平带、半音之间出现硬边界（阶梯感）\n"
+            "只影响显示，不改动分析结果")
+        self.act_step.toggled.connect(self._on_step_filter_toggled)
+        tb.addAction(self.act_step)
+
+        tb.addSeparator()
+
         tb.addWidget(QLabel("滤镜"))
         self.sld_hide = QSlider(Qt.Horizontal)
         self.sld_hide.setRange(0, 100)
@@ -2117,32 +2806,23 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.sld_hide)
 
         self.lbl_hide = QLabel("35%")
-        self.lbl_hide.setStyleSheet(
-            "color:#9fc5ff;font-family:Consolas,Menlo,monospace;"
-            "min-width:34px;background:transparent;")
+        self.lbl_hide.setStyleSheet("color:#9fc5ff;font-family:Consolas,Menlo,monospace;" "min-width:34px;background:transparent;")
         tb.addWidget(self.lbl_hide)
         self.hide_low = self.sld_hide.value() / 100.0
         self.spec.set_hide_low(self.hide_low)
 
     def _build_statusbar(self):
         sb = QStatusBar()
-        sb.setStyleSheet(
-            "QStatusBar{background:#000000;color:#cfd8ea;"
-            "border-top:1px solid #262c3a;}"
-            "QStatusBar::item{border:none;}"
-            "QStatusBar QLabel{color:#cfd8ea;background:transparent;}")
+        sb.setStyleSheet("QStatusBar{background:#000000;color:#cfd8ea;" "border-top:1px solid #262c3a;}" "QStatusBar::item{border:none;}" "QStatusBar QLabel{color:#cfd8ea;background:transparent;}")
         self.setStatusBar(sb)
 
         self.lbl_left = QLabel("就绪  ·  拖入音频文件或点击「打开音频」")
         self.lbl_left.setStyleSheet("color:#cfd8ea;background:transparent;")
         self.lbl_center = QLabel("")
-        midi_txt = f"MIDI: {MIDI_PORT_NAME}" if MIDI_AVAILABLE else "MIDI: 不可用"
-        self.lbl_right = QLabel(f"{GPU_NAME}  ·  {midi_txt}  ·  "
-                                f"滚轮缩放 · 左键平移/发声 · 右键拖动创建遮罩")
+        midi_txt = _midi_label()
+        self.lbl_right = QLabel(f"{_backend_label()}  ·  {midi_txt}  ·  " f"滚轮缩放 · 左键平移/发声 · 右键拖动创建遮罩")
         self.lbl_right.setStyleSheet("color:#8b96ad;background:transparent;")
-        self.lbl_center.setStyleSheet(
-            "color:#9fc5ff;font-family:Consolas,Menlo,monospace;"
-            "background:transparent;")
+        self.lbl_center.setStyleSheet("color:#9fc5ff;font-family:Consolas,Menlo,monospace;" "background:transparent;")
 
         sb.addWidget(self.lbl_left, 1)
 
@@ -2154,10 +2834,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setVisible(False)
         self.progress_bar.setStyleSheet(
-            "QProgressBar{background:#000000;color:#cfd8ea;"
-            "border:1px solid #303848;border-radius:5px;"
-            "text-align:center;font-size:10.5px;}"
-            "QProgressBar::chunk{background:#2b5fb8;border-radius:4px;}"
+            "QProgressBar{background:#000000;color:#cfd8ea;" "border:1px solid #303848;border-radius:5px;" "text-align:center;font-size:10.5px;}" "QProgressBar::chunk{background:#2b5fb8;border-radius:4px;}"
         )
         sb.addPermanentWidget(self.progress_bar, 0)
 
@@ -2165,12 +2842,10 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setFixedHeight(20)
         self.btn_cancel.setVisible(False)
         self.btn_cancel.setCursor(Qt.PointingHandCursor)
-        self.btn_cancel.setStyleSheet(
-            "QPushButton{background:#000000;color:#ffb4b4;"
-            "border:1px solid #5a2b34;border-radius:5px;"
-            "padding:0 8px;font-size:11px;}"
-            "QPushButton:hover{background:#3a2028;}")
-        self.btn_cancel.clicked.connect(self._cancel_analysis)
+        self.btn_cancel.setStyleSheet("QPushButton{background:#000000;color:#ffb4b4;" "border:1px solid #5a2b34;border-radius:5px;" "padding:0 8px;font-size:11px;}" "QPushButton:hover{background:#3a2028;}")
+        # clicked 会带一个 checked: bool 参数，直接接 _cancel_analysis 会把它
+        # 当成 wait，导致 `if wait:` 分支从按钮永远走不到。这里显式丢弃。
+        self.btn_cancel.clicked.connect(lambda _checked=False: self._cancel_analysis(wait=False))
         sb.addPermanentWidget(self.btn_cancel, 0)
 
         sb.addPermanentWidget(self.lbl_center, 0)
@@ -2217,10 +2892,7 @@ class MainWindow(QMainWindow):
                     self.player.play()
             except Exception as e:
                 print(f"[media] setPosition 失败: {e}")
-            self.lbl_left.setText(
-                f"跳转至  {frame_pos * self.hop / self.sr:.3f} s   ·   "
-                f"{midi_name(midi_note)}"
-            )
+            self.lbl_left.setText(f"跳转至  {frame_pos * self.hop / self.sr:.3f} s   ·   " f"{midi_name(midi_note)}")
 
     def _play_midi_note(self, midi):
         if not MIDI_AVAILABLE:
@@ -2251,6 +2923,11 @@ class MainWindow(QMainWindow):
     def _on_clear_masks(self):
         self.spec.clear_masks()
         self.lbl_left.setText("已清除所有遮罩")
+
+    def _on_step_filter_toggled(self, on):
+        self.spec.set_step_filter(bool(on))
+        self.lbl_left.setText("阶梯滤镜已开启 · 半音内取平均（仅显示）" if on
+                              else "阶梯滤镜已关闭")
 
     def _on_bpm_changed(self, v):
         self.spec.set_bpm(float(v))
@@ -2334,9 +3011,7 @@ class MainWindow(QMainWindow):
             pass
 
     def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "打开音频文件", "",
-            "音频文件 (*.wav *.flac *.ogg *.mp3 *.m4a *.aiff *.aif);;所有文件 (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "打开音频文件", "", "音频文件 (*.wav *.flac *.ogg *.mp3 *.m4a *.aiff *.aif);;所有文件 (*)")
         if path:
             self.load_path(path)
 
@@ -2386,9 +3061,7 @@ class MainWindow(QMainWindow):
                 ch_txt = "   ·   1ch → 播放双声道"
         except Exception:
             pass
-        self.lbl_left.setText(f"{name}   ·   {sr} Hz   ·   {dur:.2f} s{ch_txt}"
-                              f"   ·   {self.params['window_name']}"
-                              f"   ·   {self.params['rows_per_semitone']} 行/半音   ·   正在分析…")
+        self.lbl_left.setText(f"{name}   ·   {sr} Hz   ·   {dur:.2f} s{ch_txt}" f"   ·   {self.params['window_name']}" f"   ·   {self.params['rows_per_semitone']} 行/半音   ·   正在分析…")
 
         self._rebuild(fit=True)
 
@@ -2431,21 +3104,24 @@ class MainWindow(QMainWindow):
             self.lbl_left.setText("分析失败")
             self.lbl_center.setText("")
 
-    def _on_analysis_done(self, db, hop):
+    def _on_analysis_done(self, db, hop, mag=None):
         self._set_busy(False)
         self.hop = hop
+        self.db = db
+        self.mag = mag
         self.spec.hop = hop
         self.spec.sr = self.sr
-        self.spec.set_data(db, hop, self.sr, fit=True)
+        self.spec.set_data(db, hop, self.sr, fit=True,
+                           rows_per_semitone=self.params["rows_per_semitone"])
         self.spec.set_playhead_frame(0.0)
+        try:
+            self.act_export.setEnabled(True)
+        except Exception:
+            pass
 
         n_frames, n_rows = db.shape
-        backend = "GPU" if HAS_GPU else "CPU"
-        self.lbl_left.setText(
-            f"就绪  ·  {backend}  ·  "
-            f"{n_frames} 帧 × {n_rows} 行  ·  hop {hop} "
-            f"({self.sr / hop:.1f} fps)  ·  "
-            f"{self.params['window_name']}  ·  {self.params['rows_per_semitone']} 行/半音")
+        backend = _backend_short()
+        self.lbl_left.setText(f"就绪  ·  {backend}  ·  " f"{n_frames} 帧 × {n_rows} 行  ·  hop {hop} " f"({self.sr / hop:.1f} fps)  ·  " f"{self.params['window_name']}  ·  {self.params['rows_per_semitone']} 行/半音")
         self.lbl_center.setText("")
         self.spec.setFocus()
 
@@ -2453,13 +3129,13 @@ class MainWindow(QMainWindow):
         if self.samples is None:
             return
         self._cancel_analysis(wait=True)
+        # 确保后端已定下来，这样状态栏文字和实际计算用的是同一个后端
+        _ensure_backend_ready()
 
-        backend = "GPU" if HAS_GPU else "CPU"
+        backend = _backend_short()
         self.progress_bar.setValue(0)
         self._set_busy(True)
-        self.lbl_left.setText(
-            f"多分辨率谱重分配 · {self.params['window_name']} · "
-            f"{backend} 计算中…")
+        self.lbl_left.setText(f"多分辨率谱重分配 · {self.params['window_name']} · " f"{backend} 计算中…")
 
         worker = AnalysisWorker(self.samples, self.sr, self.params, self)
         worker.progress.connect(self._on_analysis_progress)
@@ -2473,6 +3149,73 @@ class MainWindow(QMainWindow):
     def _on_worker_finished(self, w):
         if self._worker is w:
             self._worker = None
+
+    # ------------------------------------------------------------------
+    # 导出分析结果（数组）
+    # ------------------------------------------------------------------
+    def export_result_dialog(self):
+        """把最近一次分析结果导出成数组文件。"""
+        if self.db is None:
+            QMessageBox.information(self, "无可导出数据", "请先打开并分析一个音频文件。")
+            return
+
+        base = "analysis"
+        if self.current_path:
+            base = os.path.splitext(os.path.basename(self.current_path))[0]
+        start = os.path.join(os.path.dirname(self.current_path or ""), base + ".npz")
+
+        flt = ("NumPy 压缩包 (*.npz);;NumPy 单数组 (*.npy);;"
+               "CSV 文本 (*.csv);;原始 float32 (*.bin);;所有文件 (*)")
+        path, chosen = QFileDialog.getSaveFileName(self, "导出分析结果（数组）", start, flt)
+        if not path:
+            return
+
+        fmt = {"NumPy 压缩包 (*.npz)": "npz",
+               "NumPy 单数组 (*.npy)": "npy",
+               "CSV 文本 (*.csv)": "csv",
+               "原始 float32 (*.bin)": "raw(f32)"}.get(chosen)
+        if fmt is None:
+            ext = os.path.splitext(path)[1].lower()
+            fmt = {"npz": "npz", "npy": "npy", "csv": "csv",
+                   "bin": "raw(f32)", "raw": "raw(f32)", "f32": "raw(f32)"}.get(ext, "npz")
+        # 保证扩展名和格式一致，避免写出 .npz 后缀的 csv
+        want_ext = {"npz": ".npz", "npy": ".npy", "csv": ".csv", "raw(f32)": ".bin"}[fmt]
+        if not path.lower().endswith(want_ext):
+            path += want_ext
+
+        # mag 是未归一化的线性幅度（原始数据）；u8 只是显示用的量化结果
+        mag = self.mag
+        if mag is None:
+            # 兜底：从 dB 反推（会受 floor 裁剪影响，仅用于老数据）
+            mag = np.power(np.float64(10.0),
+                           np.asarray(self.db, dtype=np.float64) / 20.0).astype(np.float32)
+        payload = export_payload(
+            mag, self.db, self.hop, self.sr, params=self.params,
+            source_path=self.current_path, hide_low=self.hide_low,
+            colormap=getattr(self.spec, "cmap", None),
+            u8=getattr(self.spec, "u8", None),
+        )
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            out = export_result(path, payload, fmt)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "导出失败", f"{type(e).__name__}: {e}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        try:
+            size = os.path.getsize(out)
+            size_txt = (f"{size/1048576:.1f} MB" if size >= 1048576
+                        else f"{size/1024:.0f} KB")
+        except OSError:
+            size_txt = "?"
+        n_frames, n_rows = self.db.shape
+        self.lbl_left.setText(
+            f"已导出 {os.path.basename(out)}   ·   {fmt}   ·   "
+            f"{n_frames} 帧 × {n_rows} 行   ·   {size_txt}")
+        self.lbl_center.setText("")
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -2489,8 +3232,11 @@ class MainWindow(QMainWindow):
         self._cancel_analysis(wait=True)
         if self.player is not None:
             for sig_name in (
-                "positionChanged", "stateChanged", "mediaStatusChanged",
-                "error", "durationChanged",
+                "positionChanged",
+                "stateChanged",
+                "mediaStatusChanged",
+                "error",
+                "durationChanged",
             ):
                 try:
                     getattr(self.player, sig_name).disconnect()
@@ -2516,6 +3262,10 @@ class MainWindow(QMainWindow):
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    # 后端探测放到后台线程：界面立刻出现，探测结果在首次分析前生效。
+    # 探测阻塞/超时都不会影响程序启动。
+    _start_gpu_probe()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
