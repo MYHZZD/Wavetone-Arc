@@ -35,7 +35,7 @@ except Exception:
 
 
 # =========================================================================
-# MIDI 输出初始化
+# MIDI 输出
 # =========================================================================
 MIDI_AVAILABLE = False
 MIDI_BACKEND = None
@@ -144,6 +144,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QFileDialog, QLabel,
     QComboBox, QSizePolicy, QMessageBox, QToolBar, QAction, QSlider,
     QStatusBar, QProgressBar, QPushButton, QDoubleSpinBox, QSpinBox,
+    QDialog, QFormLayout, QDialogButtonBox,
 )
 
 try:
@@ -165,18 +166,30 @@ BLACK_PC = {1, 3, 6, 8, 10}
 
 MIDI_MIN = 21
 MIDI_MAX = 108
-ROWS_PER_SEMITONE = 12
+DEFAULT_ROWS_PER_SEMITONE = 12
+ROWS_PER_SEMITONE_CHOICES = (6, 12, 24, 48)
 
 DB_FLOOR = -100.0
 DISPLAY_GAMMA = 1.0
 
 FFT_MIN = 1024
 FFT_MAX = 262144
-TARGET_FPS = 150
+DEFAULT_TARGET_FPS = 150
+FPS_CHOICES = (60, 100, 150, 200)
+
+WINDOW_CHOICES = (
+    "hann",
+    "blackman-harris",
+    "kaiser",
+    "hamming",
+    "flattop",
+    "blackman-harris-7",
+)
+DEFAULT_WINDOW = "hann"       # ★ 回到原版
 
 SPLAT_K = 2
-SPLAT_SIGMA_LOW = 0.6
-SPLAT_SIGMA_HIGH = 1.0
+SPLAT_SIGMA_LOW = 0.6         # ★ 回到原版：低频窄
+SPLAT_SIGMA_HIGH = 1.0        # ★ 回到原版：高频宽
 
 ENERGY_THRESHOLD_DB = -60.0
 
@@ -184,7 +197,8 @@ TIME_SPLAT_K = 2
 TIME_SPLAT_SIGMA = 0.6
 TIME_INV_SIGMA_SQ_HALF = -0.5 / (TIME_SPLAT_SIGMA * TIME_SPLAT_SIGMA)
 
-GROUP_OVERLAP = 4
+GROUP_SEMITONES = 6
+GROUP_OVERLAP = 4             # ★ 回到原版：4（重叠更多，过渡更平滑）
 
 F32 = np.float32
 F64 = np.float64
@@ -228,6 +242,8 @@ LUTS = {
     "viridis": build_lut(VIRIDIS_STOPS),
     "ice": build_lut(ICE_STOPS),
 }
+LUTS_RGB = {name: (lut[:, 0].copy(), lut[:, 1].copy(), lut[:, 2].copy())
+            for name, lut in LUTS.items()}
 
 
 # =========================================================================
@@ -360,7 +376,62 @@ def samples_to_wav_bytes(samples, sr):
 
 
 # =========================================================================
-# FFT 分组
+# 窗函数
+# =========================================================================
+_WINDOW_CACHE = {}
+
+
+def make_window(name, N):
+    key = (name, int(N))
+    cached = _WINDOW_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if name == "hann":
+        # 原版用的就是这个（np.hanning(N+1)[:N]）
+        w = np.hanning(N + 1)[:N].astype(np.float32)
+    else:
+        n = np.arange(N, dtype=np.float64)
+        if N < 2:
+            w = np.ones(N, dtype=np.float64)
+        elif name == "hamming":
+            w = 0.54 - 0.46 * np.cos(2.0 * np.pi * n / (N - 1))
+        elif name == "blackman-harris":
+            a0, a1, a2, a3 = 0.35875, 0.48829, 0.14128, 0.01168
+            w = (a0
+                 - a1 * np.cos(2.0 * np.pi * n / (N - 1))
+                 + a2 * np.cos(4.0 * np.pi * n / (N - 1))
+                 - a3 * np.cos(6.0 * np.pi * n / (N - 1)))
+        elif name == "blackman-harris-7":
+            a = (0.27105140069342, 0.43329793923448, 0.21812299954311,
+                 0.06592544638803, 0.01081174209837, 0.00077658482522,
+                 0.00001388721735)
+            w = np.full(N, a[0], dtype=np.float64)
+            for i in range(1, 7):
+                sign = -1.0 if (i % 2 == 1) else 1.0
+                w += sign * a[i] * np.cos(2.0 * np.pi * i * n / (N - 1))
+        elif name == "kaiser":
+            beta = 14.0
+            x = (2.0 * n / (N - 1)) - 1.0
+            w = np.i0(beta * np.sqrt(np.maximum(0.0, 1.0 - x * x))) / np.i0(beta)
+        elif name == "flattop":
+            a = (0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368)
+            w = (a[0]
+                 - a[1] * np.cos(2.0 * np.pi * n / (N - 1))
+                 + a[2] * np.cos(4.0 * np.pi * n / (N - 1))
+                 - a[3] * np.cos(6.0 * np.pi * n / (N - 1))
+                 + a[4] * np.cos(8.0 * np.pi * n / (N - 1)))
+        else:
+            w = 0.5 - 0.5 * np.cos(2.0 * np.pi * n / (N - 1))
+        w = w.astype(np.float32)
+
+    w = np.ascontiguousarray(w)
+    _WINDOW_CACHE[key] = w
+    return w
+
+
+# =========================================================================
+# FFT 分组规划
 # =========================================================================
 def _next_pow2(n):
     n = max(1, int(n))
@@ -372,7 +443,10 @@ def _prev_pow2(n):
     return 1 << (n.bit_length() - 1)
 
 
-def _plan_groups(sr, midi_min, midi_max, min_fft=FFT_MIN, max_fft=FFT_MAX, group_semitones=6, overlap=GROUP_OVERLAP):
+def _plan_groups(sr, midi_min, midi_max,
+                 min_fft=FFT_MIN, max_fft=FFT_MAX,
+                 group_semitones=GROUP_SEMITONES,
+                 overlap=GROUP_OVERLAP):
     ratio = 2.0 ** (1.0 / 12.0) - 1.0
     groups = []
     m = midi_min
@@ -387,6 +461,35 @@ def _plan_groups(sr, midi_min, midi_max, min_fft=FFT_MIN, max_fft=FFT_MAX, group
     return groups
 
 
+def _plan_chunks(sr, n_samples, groups):
+    plans = []
+    for m_start, m_end, N, hop_g in groups:
+        n_frames_g = n_samples // hop_g + 1
+        n_bins = N // 2 + 1
+        f_k_np = np.arange(n_bins, dtype=np.float64) * (float(sr) / float(N))
+
+        k_lo = int(np.searchsorted(f_k_np, midi_to_freq(m_start), side="left"))
+        k_hi = int(np.searchsorted(f_k_np, midi_to_freq(m_end), side="left"))
+        k_lo = max(0, min(k_lo, n_bins - 1))
+        k_hi = max(k_lo + 1, min(k_hi, n_bins))
+
+        target_mem = 1.5e8 if HAS_GPU else 4.0e8
+        chunk = max(8, int(target_mem / (n_bins * 16 * 3)))
+        starts = []
+        i0 = 0
+        while i0 < n_frames_g - 2:
+            i1 = min(i0 + chunk, n_frames_g)
+            if i1 - i0 < 3:
+                break
+            starts.append((i0, i1))
+            if i1 >= n_frames_g:
+                break
+            i0 = i1 - 2
+
+        plans.append((m_start, m_end, N, hop_g, k_lo, k_hi, starts))
+    return plans
+
+
 # =========================================================================
 # 取消异常
 # =========================================================================
@@ -395,7 +498,7 @@ class AnalysisCancelled(Exception):
 
 
 # =========================================================================
-# STFT
+# STFT（单路，与原版一致）
 # =========================================================================
 def _stft_batch(samples_xp, N, hop, i0, i1, window_xp):
     n = int(samples_xp.shape[0])
@@ -418,7 +521,7 @@ def _stft_batch(samples_xp, N, hop, i0, i1, window_xp):
 
 
 # =========================================================================
-# 阶段 1：谱重分配
+# 谱重分配：原版算法
 # =========================================================================
 def _reassign_chunk(
     X, N, hop, sr, f_k, n_rows, midi_min, midi_max,
@@ -440,6 +543,7 @@ def _reassign_chunk(
     mag = xp.abs(X_sub)
     phase = xp.angle(X_sub)
 
+    # 三帧相位差
     dphase = (phase[2:] - phase[:-2]) * 0.5
     del phase
 
@@ -482,6 +586,7 @@ def _reassign_chunk(
     mag_v = mag_mid[tv, kv]
     del r_float, mag_mid
 
+    # σ 随频率变化（原版：低频 0.6 → 高频 1.0）
     m_midi_v = (float(midi_max) + 0.5) - (r_v + 0.5) / float(rows_per_semitone)
     span_midi = float(midi_max - midi_min) if midi_max > midi_min else 1.0
     t_norm = (m_midi_v - float(midi_min)) / span_midi
@@ -523,7 +628,7 @@ def _reassign_chunk(
 
 
 # =========================================================================
-# 阶段 2：分组粗网格 → 公共网格（时间高斯 splat ）
+# 群组网格 → 公共网格（原版：纯时间高斯 splat）
 # =========================================================================
 def _splat_group_to_common(group_grid, ratio, out, n_common):
     n_g, n_rows = group_grid.shape
@@ -557,44 +662,16 @@ def _splat_group_to_common(group_grid, ratio, out, n_common):
 
 
 # =========================================================================
-# 分块规划
-# =========================================================================
-def _plan_chunks(sr, n_samples, groups):
-    plans = []
-    for m_start, m_end, N, hop_g in groups:
-        n_frames_g = n_samples // hop_g + 1
-        n_bins = N // 2 + 1
-        f_k_np = np.arange(n_bins, dtype=np.float64) * (float(sr) / float(N))
-
-        k_lo = int(np.searchsorted(f_k_np, midi_to_freq(m_start), side="left"))
-        k_hi = int(np.searchsorted(f_k_np, midi_to_freq(m_end), side="left"))
-        k_lo = max(0, min(k_lo, n_bins - 1))
-        k_hi = max(k_lo + 1, min(k_hi, n_bins))
-
-        target_mem = 1.5e8 if HAS_GPU else 4.0e8
-        chunk = max(8, int(target_mem / (n_bins * 16 * 3)))
-        starts = []
-        i0 = 0
-        while i0 < n_frames_g - 2:
-            i1 = min(i0 + chunk, n_frames_g)
-            if i1 - i0 < 3:
-                break
-            starts.append((i0, i1))
-            if i1 >= n_frames_g:
-                break
-            i0 = i1 - 2
-
-        plans.append((m_start, m_end, N, hop_g, k_lo, k_hi, starts))
-    return plans
-
-
-# =========================================================================
 # 主流程
 # =========================================================================
 def compute_reassigned_spectrogram(
-    samples, sr, midi_min=MIDI_MIN, midi_max=MIDI_MAX,
-    rows_per_semitone=ROWS_PER_SEMITONE, target_fps=TARGET_FPS,
-    max_frames=65536, progress_cb=None, cancel_cb=None,
+    samples, sr,
+    midi_min=MIDI_MIN, midi_max=MIDI_MAX,
+    rows_per_semitone=DEFAULT_ROWS_PER_SEMITONE,
+    target_fps=DEFAULT_TARGET_FPS,
+    window_name=DEFAULT_WINDOW,
+    max_frames=65536,
+    progress_cb=None, cancel_cb=None,
 ):
     n_rows = (midi_max - midi_min + 1) * rows_per_semitone
     samples_np = np.ascontiguousarray(samples, dtype=F32)
@@ -622,7 +699,7 @@ def compute_reassigned_spectrogram(
     def get_window(N):
         w = window_cache.get(N)
         if w is None:
-            w = xp.asarray(np.hanning(N + 1)[:N].astype(F32))
+            w = xp.asarray(make_window(window_name, N))
             window_cache[N] = w
         return w
 
@@ -641,7 +718,7 @@ def compute_reassigned_spectrogram(
         if not starts:
             continue
 
-        ratio = int(hop_g // base_hop)
+        ratio = max(1, int(hop_g // base_hop))
         n_g_frames = n // hop_g + 1
 
         group_grid = xp.zeros((n_g_frames, n_rows), dtype=F32)
@@ -683,10 +760,6 @@ def compute_reassigned_spectrogram(
 
     if HAS_GPU:
         out_np = xp.asnumpy(out_xp).astype(F32, copy=False)
-        try:
-            xp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
     else:
         out_np = np.asarray(out_xp, dtype=F32)
 
@@ -730,10 +803,16 @@ def db_to_u8(db, floor_db=DB_FLOOR, hide_low=0.0, gamma=DISPLAY_GAMMA):
     return norm.astype(np.uint8)
 
 
-def u8_to_qimage(u8, lut):
-    rgb_t = np.ascontiguousarray(lut[u8].transpose(1, 0, 2))
-    h, w = rgb_t.shape[:2]
-    img = QImage(rgb_t.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+def u8_to_qimage_fast(u8, rgb_lut):
+    """u8: (n_frames, n_rows) → QImage: width=n_frames, height=n_rows"""
+    r_lut, g_lut, b_lut = rgb_lut
+    n_frames, n_rows = u8.shape
+    rgb = np.empty((n_rows, n_frames, 3), dtype=np.uint8)
+    rgb[:, :, 0] = r_lut[u8].T
+    rgb[:, :, 1] = g_lut[u8].T
+    rgb[:, :, 2] = b_lut[u8].T
+    h, w = n_rows, n_frames
+    img = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format_RGB888)
     return img.copy()
 
 
@@ -745,21 +824,18 @@ class AnalysisWorker(QThread):
     done = pyqtSignal(object, int)
     failed = pyqtSignal(str)
 
-    def __init__(self, samples, sr, parent=None):
+    def __init__(self, samples, sr, params, parent=None):
         super().__init__(parent)
         self.samples = samples
         self.sr = sr
+        self.params = params
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
-    def is_cancelled(self):
-        return self._cancel
-
     def run(self):
         try:
-
             def progress_cb(frac):
                 pct = int(max(0.0, min(1.0, float(frac))) * 100)
                 self.progress.emit(pct, f"分析中… {pct}%")
@@ -770,8 +846,9 @@ class AnalysisWorker(QThread):
             mag, hop = compute_reassigned_spectrogram(
                 self.samples, self.sr,
                 midi_min=MIDI_MIN, midi_max=MIDI_MAX,
-                rows_per_semitone=ROWS_PER_SEMITONE,
-                target_fps=TARGET_FPS,
+                rows_per_semitone=self.params["rows_per_semitone"],
+                target_fps=self.params["target_fps"],
+                window_name=self.params["window_name"],
                 progress_cb=progress_cb, cancel_cb=cancel_cb,
             )
         except AnalysisCancelled:
@@ -779,7 +856,6 @@ class AnalysisWorker(QThread):
             return
         except Exception as e:
             import traceback
-
             traceback.print_exc()
             self.failed.emit(str(e))
             return
@@ -793,13 +869,70 @@ class AnalysisWorker(QThread):
             db = compute_db(mag)
         except Exception as e:
             import traceback
-
             traceback.print_exc()
             self.failed.emit(str(e))
             return
 
         self.progress.emit(100, "完成")
         self.done.emit(db, hop)
+
+
+# =========================================================================
+# 参数对话框
+# =========================================================================
+class AnalysisParamsDialog(QDialog):
+    def __init__(self, params=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("分析参数")
+        self.setModal(True)
+        self.setMinimumWidth(320)
+
+        params = params or {}
+
+        layout = QFormLayout(self)
+
+        self.cb_window = QComboBox()
+        for name in WINDOW_CHOICES:
+            self.cb_window.addItem(name)
+        cur_w = params.get("window_name", DEFAULT_WINDOW)
+        if cur_w in WINDOW_CHOICES:
+            self.cb_window.setCurrentIndex(WINDOW_CHOICES.index(cur_w))
+        self.cb_window.setToolTip("Hann 是原版默认；BH 旁瓣更低；flattop 幅度最准")
+        layout.addRow("窗函数", self.cb_window)
+
+        self.cb_rows = QComboBox()
+        for r in ROWS_PER_SEMITONE_CHOICES:
+            self.cb_rows.addItem(str(r), r)
+        cur_r = params.get("rows_per_semitone", DEFAULT_ROWS_PER_SEMITONE)
+        try:
+            self.cb_rows.setCurrentIndex(ROWS_PER_SEMITONE_CHOICES.index(cur_r))
+        except ValueError:
+            self.cb_rows.setCurrentIndex(1)
+        self.cb_rows.setToolTip("频谱图纵轴分辨率（每半音的行数）")
+        layout.addRow("每半音行数", self.cb_rows)
+
+        self.cb_fps = QComboBox()
+        for f in FPS_CHOICES:
+            self.cb_fps.addItem(str(f), f)
+        cur_f = params.get("target_fps", DEFAULT_TARGET_FPS)
+        try:
+            self.cb_fps.setCurrentIndex(FPS_CHOICES.index(cur_f))
+        except ValueError:
+            self.cb_fps.setCurrentIndex(2)
+        self.cb_fps.setToolTip("时间分辨率（每秒帧数）")
+        layout.addRow("时间分辨率 (fps)", self.cb_fps)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+
+    def get_params(self):
+        return {
+            "window_name": self.cb_window.currentText(),
+            "rows_per_semitone": int(self.cb_rows.currentData()),
+            "target_fps": int(self.cb_fps.currentData()),
+        }
 
 
 # =========================================================================
@@ -819,6 +952,16 @@ class PianoRoll(QWidget):
         self._hover = None
         self._pressed = None
         self._highlights = []
+        self._c_white = QColor(234, 238, 245)
+        self._c_black = QColor(26, 30, 38)
+        self._c_pressed_w = QColor(110, 170, 255)
+        self._c_pressed_b = QColor(40, 90, 200)
+        self._c_hover_w = QColor(196, 218, 255)
+        self._c_hover_b = QColor(66, 92, 148)
+        self._c_hl_w = QColor(255, 235, 140)
+        self._c_hl_b = QColor(190, 155, 30)
+        self._c_line = QColor(160, 166, 178)
+        self._c_border = QColor(8, 10, 14)
 
     def set_highlight(self, midi):
         midi = int(midi)
@@ -859,17 +1002,16 @@ class PianoRoll(QWidget):
         p = QPainter(self)
         W, H = self.width(), self.height()
         p.fillRect(0, 0, W, H, QColor(16, 19, 26))
-
         highlight_set = set(self._highlights)
 
         def pick(m, white_mode):
             if m == self._pressed:
-                return QColor(110, 170, 255) if white_mode else QColor(40, 90, 200)
+                return self._c_pressed_w if white_mode else self._c_pressed_b
             if m == self._hover:
-                return QColor(196, 218, 255) if white_mode else QColor(66, 92, 148)
+                return self._c_hover_w if white_mode else self._c_hover_b
             if m in highlight_set:
-                return QColor(255, 235, 140) if white_mode else QColor(190, 155, 30)
-            return QColor(234, 238, 245) if white_mode else QColor(26, 30, 38)
+                return self._c_hl_w if white_mode else self._c_hl_b
+            return self._c_white if white_mode else self._c_black
 
         for m in range(self.midi_min, self.midi_max + 1):
             if (m % 12) in BLACK_PC:
@@ -877,7 +1019,7 @@ class PianoRoll(QWidget):
             r = self._key_rect(m)
             p.fillRect(r, pick(m, True))
             if m % 12 in (0, 5):
-                p.setPen(QPen(QColor(160, 166, 178), 1))
+                p.setPen(QPen(self._c_line, 1))
                 p.drawLine(QPointF(0.0, r.bottom()), QPointF(r.right(), r.bottom()))
 
         for m in range(self.midi_min, self.midi_max + 1):
@@ -888,22 +1030,18 @@ class PianoRoll(QWidget):
             black_w = full_w * 0.62
             right_x = r.x() + black_w
             right_w = full_w - black_w
-
             mid_y = r.y() + r.height() * 0.5
             top_half = QRectF(right_x, r.y(), right_w, r.height() * 0.5)
             bottom_half = QRectF(right_x, mid_y, right_w, r.height() * 0.5)
-
             if m + 1 <= self.midi_max:
                 p.fillRect(top_half, pick(m + 1, True))
             if m - 1 >= self.midi_min:
                 p.fillRect(bottom_half, pick(m - 1, True))
-
-            p.setPen(QPen(QColor(160, 166, 178), 1))
+            p.setPen(QPen(self._c_line, 1))
             p.drawLine(QPointF(right_x, mid_y), QPointF(r.right(), mid_y))
-
             left_rect = QRectF(r.x(), r.y(), black_w, r.height())
             p.fillRect(left_rect, pick(m, False))
-            p.setPen(QPen(QColor(8, 10, 14), 1))
+            p.setPen(QPen(self._c_border, 1))
             p.drawRect(left_rect.adjusted(0.0, 0.0, -0.5, -0.5))
 
         f = QFont()
@@ -917,7 +1055,8 @@ class PianoRoll(QWidget):
             if r.height() < 8.5:
                 continue
             octv = m // 12 - 1
-            p.drawText(QRectF(W * 0.30, r.top(), W * 0.64, r.height()), Qt.AlignVCenter | Qt.AlignRight, f"C{octv}")
+            p.drawText(QRectF(W * 0.30, r.top(), W * 0.64, r.height()),
+                       Qt.AlignVCenter | Qt.AlignRight, f"C{octv}")
 
         p.setPen(QPen(QColor(48, 55, 70), 1))
         p.drawLine(W - 1, 0, W - 1, H)
@@ -958,13 +1097,12 @@ class SpectrogramView(QWidget):
     clicked = pyqtSignal(float, int)
     noteTriggered = pyqtSignal(int)
     maskSelected = pyqtSignal(int)
-    followModeChanged = pyqtSignal(bool)   # ★ 新增
+    followModeChanged = pyqtSignal(bool)
 
     def __init__(self, midi_min=MIDI_MIN, midi_max=MIDI_MAX, parent=None):
         super().__init__(parent)
         self.midi_min = midi_min
         self.midi_max = midi_max
-
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(400, 240)
         self.setMouseTracking(True)
@@ -982,12 +1120,12 @@ class SpectrogramView(QWidget):
 
         self.cmap = "magma"
         self.lut = LUTS[self.cmap]
+        self.rgb_lut = LUTS_RGB[self.cmap]
         self.hide_low = 0.0
         self.show_grid = True
 
         self.harmonics = 0
         self.playhead_frame = None
-
         self.view_start = 0.0
         self.scale = 1.0
 
@@ -995,7 +1133,6 @@ class SpectrogramView(QWidget):
         self._mask_drag = None
         self.selected_mask = None
 
-        # ★ 跟随状态
         self.follow_mode = False
         self._follow_ratio = 0.25
         self._has_manual_seek = False
@@ -1012,28 +1149,22 @@ class SpectrogramView(QWidget):
         self._drag_moved = False
         self._hover = None
 
-    # ------------------------------------------------------------------
-    # 跟随控制（对外 API）
-    # ------------------------------------------------------------------
     def set_follow_mode(self, on):
         on = bool(on)
         if on == self.follow_mode:
             return
         self.follow_mode = on
         if on:
-            # 如果没手动 seek 过 → 使用默认 25%
             if not self._has_manual_seek:
                 self._follow_ratio = 0.25
             self._apply_follow()
         self.update()
 
     def reset_follow_state(self):
-        """停止播放时调用：重置比例 + 清手动 seek 标记。"""
         self._follow_ratio = 0.25
         self._has_manual_seek = False
 
     def _cancel_follow(self):
-        """拖动频谱 / 用户干预时调用：关闭跟随 + 重置比例。"""
         changed = False
         if self.follow_mode:
             self.follow_mode = False
@@ -1044,13 +1175,11 @@ class SpectrogramView(QWidget):
             self.followModeChanged.emit(False)
 
     def _apply_follow(self):
-        """把 view_start 设置为让播放头保持在 _follow_ratio 处。"""
         if self.n_frames <= 0 or self.playhead_frame is None:
             return
         W = max(1, self.width())
         visible = W / self.scale
         if visible >= self.n_frames:
-            # 全部可见，无需滚动
             return
         new_view_start = self.playhead_frame - self._follow_ratio * visible
         max_view_start = self.n_frames - visible
@@ -1059,9 +1188,6 @@ class SpectrogramView(QWidget):
             self.view_start = new_view_start
             self._invalidate()
 
-    # ------------------------------------------------------------------
-    # 数据
-    # ------------------------------------------------------------------
     def set_data(self, db, hop, sr, fit=True):
         self.db = db
         self.hop = hop
@@ -1071,7 +1197,6 @@ class SpectrogramView(QWidget):
         if self.selected_mask is not None:
             self.selected_mask = None
             self.maskSelected.emit(-1)
-        # 换数据后跟随状态重置
         self._has_manual_seek = False
         self._follow_ratio = 0.25
         if fit:
@@ -1085,8 +1210,9 @@ class SpectrogramView(QWidget):
             return
         self.cmap = name
         self.lut = LUTS[name]
+        self.rgb_lut = LUTS_RGB[name]
         if self.u8 is not None:
-            self.qimg = u8_to_qimage(self.u8, self.lut)
+            self.qimg = u8_to_qimage_fast(self.u8, self.rgb_lut)
         self._invalidate()
 
     def set_hide_low(self, v):
@@ -1119,7 +1245,6 @@ class SpectrogramView(QWidget):
         if self.playhead_frame is not None and abs(frame - self.playhead_frame) < 0.01:
             return
         self.playhead_frame = float(frame)
-
         if self.follow_mode and self.n_frames > 0:
             self._apply_follow()
         self.update()
@@ -1158,9 +1283,6 @@ class SpectrogramView(QWidget):
             self.maskSelected.emit(-1)
             self.update()
 
-    # ------------------------------------------------------------------
-    # 遮罩
-    # ------------------------------------------------------------------
     def _harmonic_notes(self, midi_n):
         notes = [int(round(midi_n))]
         for k in range(2, self.harmonics + 2):
@@ -1202,7 +1324,6 @@ class SpectrogramView(QWidget):
         if x1c <= x0c:
             return
         rect_w = x1c - x0c
-
         for k in range(1, self.harmonics + 2):
             mf = midi_n + 12.0 * math.log2(k)
             y_top = midi_to_y(mf + 0.5, H, self.midi_min, self.midi_max)
@@ -1216,15 +1337,12 @@ class SpectrogramView(QWidget):
     def _draw_masks(self, p, W, H):
         if not self.masks and self._mask_drag is None:
             return
-
         p.setPen(Qt.NoPen)
         fill_normal = QColor(0, 0, 0, 250)
         fill_selected = QColor(255, 255, 255, 250)
-
         for idx, (f_start, f_end, midi_n) in enumerate(self.masks):
             fill = fill_selected if idx == self.selected_mask else fill_normal
             self._draw_mask_one(p, W, H, f_start, f_end, midi_n, fill)
-
         if self._mask_drag is not None:
             f_start, f_end, midi_n = self._mask_drag
             self._draw_mask_one(p, W, H, f_start, f_end, midi_n, fill_normal)
@@ -1234,11 +1352,9 @@ class SpectrogramView(QWidget):
             return
         if self.bpm <= 0 or self.scale <= 0:
             return
-
         frames_per_beat = (60.0 / float(self.bpm)) * self.sr / float(self.hop)
         if frames_per_beat <= 1e-6:
             return
-
         px_per_beat = frames_per_beat * self.scale
         px_per_bar = px_per_beat * self.beats_per_bar
         draw_beat_lines = px_per_beat >= 6.0
@@ -1248,7 +1364,6 @@ class SpectrogramView(QWidget):
 
         f0 = self.view_start
         f1 = self.view_start + W / self.scale
-
         i0 = max(0, int(math.floor((f0 - self.beat_offset_frames) / frames_per_beat)) - 1)
         i1 = int(math.ceil((f1 - self.beat_offset_frames) / frames_per_beat)) + 1
         if i1 - i0 > 20000:
@@ -1279,7 +1394,7 @@ class SpectrogramView(QWidget):
             self.qimg = None
             return
         self.u8 = db_to_u8(self.db, floor_db=DB_FLOOR, hide_low=self.hide_low, gamma=DISPLAY_GAMMA)
-        self.qimg = u8_to_qimage(self.u8, self.lut)
+        self.qimg = u8_to_qimage_fast(self.u8, self.rgb_lut)
 
     def fit_view(self):
         W = max(1, self.width())
@@ -1322,7 +1437,6 @@ class SpectrogramView(QWidget):
             if self.scale < ms:
                 self.scale = ms
         self._clamp_view()
-        # 若跟随中，重新应用比例（宽度变了 visible 也变）
         if self.follow_mode:
             self._apply_follow()
         self._invalidate()
@@ -1353,7 +1467,6 @@ class SpectrogramView(QWidget):
             mf = midi_n + 12.0 * math.log2(k)
             if self.midi_min - 1.0 <= mf <= self.midi_max + 1.0:
                 marks.append((mf, False))
-
         for mf, is_fund in marks:
             y_top = midi_to_y(mf + 0.5, H, self.midi_min, self.midi_max)
             y_bot = midi_to_y(mf - 0.5, H, self.midi_min, self.midi_max)
@@ -1398,7 +1511,9 @@ class SpectrogramView(QWidget):
             f = QFont()
             f.setPointSizeF(10.5)
             p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignCenter, "打开音频文件以显示频谱图\n\n" "滚轮缩放 · 左键拖拽平移 · 右键拖拽创建遮罩")
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       "打开音频文件以显示频谱图\n\n"
+                       "滚轮缩放 · 左键拖拽平移 · 右键拖拽创建遮罩")
             return
 
         if self._cache is None or self._cache.size() != QSize(W, H):
@@ -1495,7 +1610,6 @@ class SpectrogramView(QWidget):
             midi_n = max(self.midi_min, min(self.midi_max, midi_n))
             self.hoverNote.emit(midi_n)
             self.hoverNotes.emit(self._harmonic_notes(midi_n))
-
             frame = self.view_start + pos.x() / self.scale
             t = frame * self.hop / float(self.sr)
             f_hz = midi_to_freq(midi_n)
@@ -1507,7 +1621,6 @@ class SpectrogramView(QWidget):
     def mousePressEvent(self, e):
         if self.n_frames <= 0:
             return
-
         if e.button() == Qt.RightButton:
             if self.selected_mask is not None:
                 self.selected_mask = None
@@ -1518,7 +1631,6 @@ class SpectrogramView(QWidget):
             self.setCursor(Qt.SizeHorCursor)
             self.update()
             return
-
         if e.button() == Qt.LeftButton:
             hit = self._mask_at_pos(e.pos())
             if hit is not None:
@@ -1531,12 +1643,10 @@ class SpectrogramView(QWidget):
                 self.setFocus(Qt.MouseFocusReason)
                 self.update()
                 return
-
             if self.selected_mask is not None:
                 self.selected_mask = None
                 self.maskSelected.emit(-1)
                 self.update()
-
             midi_n = self._midi_at_pos(e.pos())
             self.noteTriggered.emit(midi_n)
             self._press_pos = e.pos()
@@ -1547,7 +1657,6 @@ class SpectrogramView(QWidget):
 
     def mouseMoveEvent(self, e):
         self._hover = e.pos()
-
         if self._mask_drag is not None and (e.buttons() & Qt.RightButton):
             f = self._frame_at_x(e.pos().x())
             f_start = self._mask_drag[0]
@@ -1557,19 +1666,16 @@ class SpectrogramView(QWidget):
                 self.update()
             self._emit_hover_info(e.pos())
             return
-
         if self._drag_x0 is not None and self._press_pos is not None:
             dx = e.pos().x() - self._drag_x0
             dy = e.pos().y() - self._press_pos.y()
             if not self._drag_moved and (abs(dx) > 4 or abs(dy) > 4):
                 self._drag_moved = True
-                # ★ 用户开始拖动平移 → 取消跟随
                 self._cancel_follow()
             if self._drag_moved:
                 self.view_start = self._drag_view0 - dx / self.scale
                 self._clamp_view()
                 self._invalidate()
-
         self.update()
         self._emit_hover_info(e.pos())
 
@@ -1586,10 +1692,8 @@ class SpectrogramView(QWidget):
             self.setCursor(Qt.CrossCursor)
             self.update()
             return
-
         if e.button() == Qt.LeftButton:
             if not self._drag_moved and self._press_pos is not None and self.n_frames > 0:
-                # ★ 手动指定播放头位置 → 记录比例，供后续跟随使用
                 W = max(1, self.width())
                 click_ratio = self._press_pos.x() / float(W)
                 self._follow_ratio = max(0.05, min(0.95, click_ratio))
@@ -1615,7 +1719,6 @@ class SpectrogramView(QWidget):
 
     def keyPressEvent(self, e):
         key = e.key()
-
         if key in (Qt.Key_Delete, Qt.Key_Backspace):
             if self.selected_mask is not None and 0 <= self.selected_mask < len(self.masks):
                 del self.masks[self.selected_mask]
@@ -1626,7 +1729,6 @@ class SpectrogramView(QWidget):
                 return
             e.accept()
             return
-
         if key == Qt.Key_Escape:
             if self.selected_mask is not None:
                 self.selected_mask = None
@@ -1634,7 +1736,6 @@ class SpectrogramView(QWidget):
                 self.update()
                 e.accept()
                 return
-
         if key == Qt.Key_Left:
             self.view_start -= self.width() / self.scale * 0.15
             self._clamp_view()
@@ -1666,8 +1767,13 @@ class MainWindow(QMainWindow):
         self.hide_low = 0.0
         self.current_path = None
 
-        self.playback_samples = None
+        self.params = {
+            "window_name": DEFAULT_WINDOW,
+            "rows_per_semitone": DEFAULT_ROWS_PER_SEMITONE,
+            "target_fps": DEFAULT_TARGET_FPS,
+        }
 
+        self.playback_samples = None
         self.wav_bytes = None
         self._wav_buffer = None
         self._wav_temp_path = None
@@ -1688,7 +1794,7 @@ class MainWindow(QMainWindow):
         self._note_off_timer.timeout.connect(self._stop_active_note)
 
         self._playhead_timer = QTimer(self)
-        self._playhead_timer.setInterval(10)
+        self._playhead_timer.setInterval(16)
         self._playhead_timer.timeout.connect(self._tick_playhead)
 
         self.player = None
@@ -1714,16 +1820,12 @@ class MainWindow(QMainWindow):
             print(f"[media] QMediaPlayer 创建失败: {e}")
             self.player = None
 
-    # -----------------------------------------------------------------
-    # 媒体加载
-    # -----------------------------------------------------------------
     def _release_media(self):
         if self.player is not None:
             try:
                 self.player.stop()
             except Exception:
                 pass
-
         if self._wav_buffer is not None:
             try:
                 self._wav_buffer.close()
@@ -1734,10 +1836,8 @@ class MainWindow(QMainWindow):
     def _load_media_from_samples(self, samples, sr, source_path=None):
         if self.player is None:
             return
-
         old_tmp = self._wav_temp_path
         self._wav_temp_path = None
-
         self._release_media()
 
         try:
@@ -1761,17 +1861,14 @@ class MainWindow(QMainWindow):
             return
 
         self.wav_bytes = wav_bytes
-
         try:
             import tempfile
-
             fd, tmp = tempfile.mkstemp(prefix="wavetonepro_", suffix=".wav")
             with os.fdopen(fd, "wb") as f:
                 f.write(wav_bytes)
             self._wav_temp_path = tmp
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(tmp)))
             self._warmup_player()
-
             if old_tmp:
                 try:
                     os.remove(old_tmp)
@@ -1783,7 +1880,6 @@ class MainWindow(QMainWindow):
 
         try:
             from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
-
             buf = QBuffer(self)
             buf.setData(QByteArray(wav_bytes))
             if not buf.open(QIODevice.ReadOnly):
@@ -1908,6 +2004,11 @@ class MainWindow(QMainWindow):
         act_open.triggered.connect(self.open_file)
         tb.addAction(act_open)
 
+        act_params = QAction("参数 ⚙", self)
+        act_params.setToolTip("修改分析参数并重新分析")
+        act_params.triggered.connect(self.open_params_dialog)
+        tb.addAction(act_params)
+
         act_fit = QAction("适应 🔍", self)
         act_fit.setToolTip("适应窗口 (Ctrl+0)")
         act_fit.setShortcut("Ctrl+0")
@@ -1955,7 +2056,8 @@ class MainWindow(QMainWindow):
         self.cb_cmap.setFixedWidth(75)
         for name in ("magma", "inferno", "viridis", "ice"):
             self.cb_cmap.addItem(name, name)
-        self.cb_cmap.currentIndexChanged.connect(lambda i: self.spec.set_colormap(self.cb_cmap.itemData(i)))
+        self.cb_cmap.currentIndexChanged.connect(
+            lambda i: self.spec.set_colormap(self.cb_cmap.itemData(i)))
         tb.addWidget(self.cb_cmap)
 
         tb.addWidget(QLabel("泛音数量"))
@@ -1964,7 +2066,8 @@ class MainWindow(QMainWindow):
         self.cb_harm.setFixedWidth(40)
         for n in range(6):
             self.cb_harm.addItem(str(n), n)
-        self.cb_harm.currentIndexChanged.connect(lambda i: self.spec.set_harmonics(self.cb_harm.itemData(i)))
+        self.cb_harm.currentIndexChanged.connect(
+            lambda i: self.spec.set_harmonics(self.cb_harm.itemData(i)))
         tb.addWidget(self.cb_harm)
 
         tb.addSeparator()
@@ -2014,23 +2117,32 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.sld_hide)
 
         self.lbl_hide = QLabel("35%")
-        self.lbl_hide.setStyleSheet("color:#9fc5ff;font-family:Consolas,Menlo,monospace;" "min-width:34px;background:transparent;")
+        self.lbl_hide.setStyleSheet(
+            "color:#9fc5ff;font-family:Consolas,Menlo,monospace;"
+            "min-width:34px;background:transparent;")
         tb.addWidget(self.lbl_hide)
         self.hide_low = self.sld_hide.value() / 100.0
         self.spec.set_hide_low(self.hide_low)
 
     def _build_statusbar(self):
         sb = QStatusBar()
-        sb.setStyleSheet("QStatusBar{background:#000000;color:#cfd8ea;" "border-top:1px solid #262c3a;}" "QStatusBar::item{border:none;}" "QStatusBar QLabel{color:#cfd8ea;background:transparent;}")
+        sb.setStyleSheet(
+            "QStatusBar{background:#000000;color:#cfd8ea;"
+            "border-top:1px solid #262c3a;}"
+            "QStatusBar::item{border:none;}"
+            "QStatusBar QLabel{color:#cfd8ea;background:transparent;}")
         self.setStatusBar(sb)
 
         self.lbl_left = QLabel("就绪  ·  拖入音频文件或点击「打开音频」")
         self.lbl_left.setStyleSheet("color:#cfd8ea;background:transparent;")
         self.lbl_center = QLabel("")
         midi_txt = f"MIDI: {MIDI_PORT_NAME}" if MIDI_AVAILABLE else "MIDI: 不可用"
-        self.lbl_right = QLabel(f"{GPU_NAME}  ·  {midi_txt}  ·  " f"滚轮缩放 · 左键平移/发声 · 右键拖动创建遮罩")
+        self.lbl_right = QLabel(f"{GPU_NAME}  ·  {midi_txt}  ·  "
+                                f"滚轮缩放 · 左键平移/发声 · 右键拖动创建遮罩")
         self.lbl_right.setStyleSheet("color:#8b96ad;background:transparent;")
-        self.lbl_center.setStyleSheet("color:#9fc5ff;font-family:Consolas,Menlo,monospace;" "background:transparent;")
+        self.lbl_center.setStyleSheet(
+            "color:#9fc5ff;font-family:Consolas,Menlo,monospace;"
+            "background:transparent;")
 
         sb.addWidget(self.lbl_left, 1)
 
@@ -2042,7 +2154,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setVisible(False)
         self.progress_bar.setStyleSheet(
-            "QProgressBar{background:#000000;color:#cfd8ea;" "border:1px solid #303848;border-radius:5px;" "text-align:center;font-size:10.5px;}" "QProgressBar::chunk{background:#2b5fb8;border-radius:4px;}"
+            "QProgressBar{background:#000000;color:#cfd8ea;"
+            "border:1px solid #303848;border-radius:5px;"
+            "text-align:center;font-size:10.5px;}"
+            "QProgressBar::chunk{background:#2b5fb8;border-radius:4px;}"
         )
         sb.addPermanentWidget(self.progress_bar, 0)
 
@@ -2050,16 +2165,17 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setFixedHeight(20)
         self.btn_cancel.setVisible(False)
         self.btn_cancel.setCursor(Qt.PointingHandCursor)
-        self.btn_cancel.setStyleSheet("QPushButton{background:#000000;color:#ffb4b4;" "border:1px solid #5a2b34;border-radius:5px;" "padding:0 8px;font-size:11px;}" "QPushButton:hover{background:#3a2028;}")
+        self.btn_cancel.setStyleSheet(
+            "QPushButton{background:#000000;color:#ffb4b4;"
+            "border:1px solid #5a2b34;border-radius:5px;"
+            "padding:0 8px;font-size:11px;}"
+            "QPushButton:hover{background:#3a2028;}")
         self.btn_cancel.clicked.connect(self._cancel_analysis)
         sb.addPermanentWidget(self.btn_cancel, 0)
 
         sb.addPermanentWidget(self.lbl_center, 0)
         sb.addPermanentWidget(self.lbl_right, 0)
 
-    # -----------------------------------------------------------------
-    # 事件响应
-    # -----------------------------------------------------------------
     def _on_hover(self, text):
         self.lbl_center.setText(text)
 
@@ -2076,7 +2192,6 @@ class MainWindow(QMainWindow):
             return
         self.lbl_left.setText(f"已选中遮罩 #{idx + 1}  ·  按 Delete/Backspace 删除，Esc 取消")
 
-    # ★ 跟随模式
     def _on_follow_toggled(self, on):
         self.spec.set_follow_mode(bool(on))
         if on:
@@ -2085,7 +2200,6 @@ class MainWindow(QMainWindow):
             self.lbl_left.setText("跟随模式已关闭")
 
     def _on_follow_changed_externally(self, on):
-        # 来自 SpectrogramView（拖动取消）
         if self.act_follow.isChecked() != on:
             self.act_follow.setChecked(on)
         self.lbl_left.setText("跟随模式已开启" if on else "跟随模式已关闭（拖动已取消）")
@@ -2146,9 +2260,6 @@ class MainWindow(QMainWindow):
         self.spec.set_show_beats(bool(on))
         self.lbl_left.setText("已显示节拍线" if on else "已隐藏节拍线")
 
-    # -----------------------------------------------------------------
-    # 播放控制
-    # -----------------------------------------------------------------
     def _on_play(self):
         if self.player is None or self.current_path is None:
             return
@@ -2189,7 +2300,6 @@ class MainWindow(QMainWindow):
             print(f"[media] stop(soft) 失败: {e}")
         self._is_playing = False
         self._playhead_timer.stop()
-        # ★ 停止 → 重置跟随比例与手动 seek 标记，之后播放头从起点自然起步
         self.spec.reset_follow_state()
         self.spec.set_playhead_frame(0.0)
         self.lbl_left.setText("已停止，播放头归零")
@@ -2223,13 +2333,21 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # -----------------------------------------------------------------
-    # 打开 / 加载
-    # -----------------------------------------------------------------
     def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开音频文件", "", "音频文件 (*.wav *.flac *.ogg *.mp3 *.m4a *.aiff *.aif);;所有文件 (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开音频文件", "",
+            "音频文件 (*.wav *.flac *.ogg *.mp3 *.m4a *.aiff *.aif);;所有文件 (*)")
         if path:
             self.load_path(path)
+
+    def open_params_dialog(self):
+        dlg = AnalysisParamsDialog(self.params, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self.params = dlg.get_params()
+        if self.samples is not None:
+            self._rebuild(fit=True)
+            self.lbl_left.setText("参数已更新，正在重新分析…")
 
     def load_path(self, path):
         self._cancel_analysis(wait=True)
@@ -2242,6 +2360,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法加载", str(e))
             return
         QApplication.restoreOverrideCursor()
+
+        dlg = AnalysisParamsDialog(self.params, self)
+        if dlg.exec_() != QDialog.Accepted:
+            self.lbl_left.setText("已取消加载")
+            return
+        self.params = dlg.get_params()
 
         self.samples = to_mono(samples)
         self.sr = sr
@@ -2262,13 +2386,12 @@ class MainWindow(QMainWindow):
                 ch_txt = "   ·   1ch → 播放双声道"
         except Exception:
             pass
-        self.lbl_left.setText(f"{name}   ·   {sr} Hz   ·   {dur:.2f} s{ch_txt}   ·   正在分析…")
+        self.lbl_left.setText(f"{name}   ·   {sr} Hz   ·   {dur:.2f} s{ch_txt}"
+                              f"   ·   {self.params['window_name']}"
+                              f"   ·   {self.params['rows_per_semitone']} 行/半音   ·   正在分析…")
 
         self._rebuild(fit=True)
 
-    # -----------------------------------------------------------------
-    # 异步分析
-    # -----------------------------------------------------------------
     def _cancel_analysis(self, wait=False):
         w = self._worker
         if w is not None and w.isRunning():
@@ -2310,7 +2433,6 @@ class MainWindow(QMainWindow):
 
     def _on_analysis_done(self, db, hop):
         self._set_busy(False)
-
         self.hop = hop
         self.spec.hop = hop
         self.spec.sr = self.sr
@@ -2319,22 +2441,27 @@ class MainWindow(QMainWindow):
 
         n_frames, n_rows = db.shape
         backend = "GPU" if HAS_GPU else "CPU"
-        self.lbl_left.setText(f"就绪  ·  {backend}  ·  " f"{n_frames} 帧 × {n_rows} 行  ·  hop {hop} " f"({self.sr / hop:.1f} fps)")
+        self.lbl_left.setText(
+            f"就绪  ·  {backend}  ·  "
+            f"{n_frames} 帧 × {n_rows} 行  ·  hop {hop} "
+            f"({self.sr / hop:.1f} fps)  ·  "
+            f"{self.params['window_name']}  ·  {self.params['rows_per_semitone']} 行/半音")
         self.lbl_center.setText("")
         self.spec.setFocus()
 
     def _rebuild(self, fit=True):
         if self.samples is None:
             return
-
         self._cancel_analysis(wait=True)
 
         backend = "GPU" if HAS_GPU else "CPU"
         self.progress_bar.setValue(0)
         self._set_busy(True)
-        self.lbl_left.setText(f"多分辨率谱重分配 (三帧相位 + 自适应 sigma) · {backend} 计算中…")
+        self.lbl_left.setText(
+            f"多分辨率谱重分配 · {self.params['window_name']} · "
+            f"{backend} 计算中…")
 
-        worker = AnalysisWorker(self.samples, self.sr, self)
+        worker = AnalysisWorker(self.samples, self.sr, self.params, self)
         worker.progress.connect(self._on_analysis_progress)
         worker.done.connect(self._on_analysis_done)
         worker.failed.connect(self._on_analysis_failed)
@@ -2347,9 +2474,6 @@ class MainWindow(QMainWindow):
         if self._worker is w:
             self._worker = None
 
-    # -----------------------------------------------------------------
-    # 拖拽 / 关闭
-    # -----------------------------------------------------------------
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
@@ -2363,7 +2487,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._cancel_analysis(wait=True)
-
         if self.player is not None:
             for sig_name in (
                 "positionChanged", "stateChanged", "mediaStatusChanged",
@@ -2377,16 +2500,13 @@ class MainWindow(QMainWindow):
                 self.player.stop()
             except Exception:
                 pass
-
         if self._wav_temp_path:
             try:
                 os.remove(self._wav_temp_path)
             except Exception:
                 pass
             self._wav_temp_path = None
-
         self._wav_buffer = None
-
         super().closeEvent(e)
 
 
@@ -2407,6 +2527,13 @@ def main():
         "border:1px solid #303848;padding:3px 6px;}"
         "QMenu{background:#000000;color:#cfd8ea;border:1px solid #303848;}"
         "QMenu::item:selected{background:#2b5fb8;color:#ffffff;}"
+        "QDialog{background:#0a0d13;color:#cfd8ea;}"
+        "QDialog QLabel{color:#cfd8ea;}"
+        "QDialog QComboBox{background:#000000;color:#cfd8ea;"
+        "border:1px solid #303848;border-radius:5px;padding:2px 6px;}"
+        "QDialog QPushButton{background:#131a26;color:#cfd8ea;"
+        "border:1px solid #303848;border-radius:5px;padding:4px 12px;}"
+        "QDialog QPushButton:hover{background:#1a2434;}"
         "QScrollBar:vertical{background:#000000;width:10px;margin:0;}"
         "QScrollBar::handle:vertical{background:#2a3346;border-radius:5px;min-height:20px;}"
         "QScrollBar::handle:vertical:hover{background:#3a4560;}"
