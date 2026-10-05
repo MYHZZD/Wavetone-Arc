@@ -1,0 +1,11 @@
+# 构建 WavetonePro 独立 exe 所需的依赖（只装这些，别装全局环境里的其它库）
+#
+# 这个清单刻意保持最小：torch / gradio / pandas / matplotlib 之类都不需要。
+# cupy-cuda11x 必须与打包进 exe 的 CUDA 运行库版本一致（11.x）。
+numpy==2.2.6
+PyQt5==5.15.11
+soundfile==0.14.0
+mido==1.3.2
+python-rtmidi==1.5.8
+cupy-cuda11x==13.6.0
+pyinstaller==6.22.3

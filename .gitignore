@@ -1,3 +1,23 @@
-/__pycache__
+# ---- 源码/数据杂项 ----
+__pycache__/
 /.wavetonepro_gpu.json
 1.20.flac
+
+# ---- 打包工作区 build\ ----
+# 工具（进版本库，别忽略）：
+#   build\build_exe.ps1          一键构建
+#   build\wavetonepro.spec       PyInstaller 配置
+#   build\requirements-build.txt 构建依赖清单
+#   build\rthook_cuda.py         运行时钩子
+#   build\cuda_isolation_test.py 隔离验证脚本
+#
+# 下面这些是"可再生"的：删掉只是变慢/需要重新构建，重新跑一次脚本就会重建。
+/build/venv/
+/build/cuda/
+/build/work/
+/build/dist/
+/build/logs/
+/build/tmp/
+/build/pip-cache/
+/build/pyinstaller-cache/
+/build/cupy-cache/
