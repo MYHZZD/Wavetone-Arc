@@ -1,6 +1,6 @@
 # ---- 源码/数据杂项 ----
 __pycache__/
-/.wavetonepro_gpu.json
+/wtpro/.wavetonepro_gpu.json
 1.20.flac
 
 # ---- 打包工作区 build\ ----
