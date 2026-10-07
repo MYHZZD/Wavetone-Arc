@@ -76,11 +76,10 @@ class MainWindow(QMainWindow):
         self._is_playing = False
         self._worker = None
 
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.setInterval(120)
-        self._hide_timer.timeout.connect(self._apply_hide_low)
-
+        # 这里原来有个 120 ms 的 _hide_timer，用来把"拖动中的过渡值"合并掉。
+        # 现在滑块的 valueReleased 只在松手时发一次（ReleaseSlider），拖动中
+        # 根本不触发处理，防抖已经是多余的；留着只会让松手后的画面晚 120 ms
+        # 才更新，看着像"变了两次"。所以直接同步应用。
         self._active_note = None
         self._note_off_timer = QTimer(self)
         self._note_off_timer.setSingleShot(True)
@@ -108,7 +107,8 @@ class MainWindow(QMainWindow):
         if backends._GPU_PROBE_DONE is not None and backends._GPU_PROBE_DONE.is_set():
             self._on_backend_changed(backends.GPU_STATUS)
 
-        QTimer.singleShot(0, lambda: self.resize(1400, 860))
+        # 这里原来还有一句 QTimer.singleShot(0, resize(...))，但构造函数开头
+        # 已经 resize 过一次、后面也没有依赖布局变化的尺寸调整，属于纯冗余，已删。
 
     def _on_backend_changed(self, name=""):
         """在主线程刷新与后端相关的文字。"""
@@ -249,15 +249,6 @@ class MainWindow(QMainWindow):
             return
         self._audio.set_volume(value_0_1)
 
-    def _warmup_player(self):
-        """预生成变体后不再需要预热。
-
-        原来的预热是为了让 DirectShow 提前把图建好、避免第一次 play 卡顿；
-        现在切声道根本不碰 setMedia，播放器是真正开始播时才创建的，所以
-        这段"静音播 80 ms 再恢复"的绕路可以去掉。
-        """
-        return
-
     def _build_ui(self):
         central = QWidget()
         central.setStyleSheet("background:#000000;")
@@ -345,15 +336,14 @@ class MainWindow(QMainWindow):
 
         self.act_export = QAction("导出 💾", self)
         self.act_export.setToolTip(
-            "把分析结果导出为数组文件，各格式的导出内容如下：\n"
-            "  npz：mag、db、u8 三个数组，附带 time_s / midi / freq_hz 坐标轴\n"
-            "       与全部分析参数，压缩存储。\n"
-            "  npy：仅 mag 单数组。\n"
-            "  csv：首列为时间，其余列按中音号命名，表头带 # 注释元数据。\n"
-            "  raw(f32)：仅 mag，按小端 float32 顺序写出，无文件头。\n"
-            "mag 为未归一化的线性幅度，保留原始量纲；db 为显示用 dB 值，\n"
-            "已将全曲峰值归一到 0 dB。u8 为当前主题与显示域对应的色号，\n"
-            "更换显示设置后即失效。\n"
+            "导出分析结果。**导出什么由你选的格式决定**：\n"
+            "  .png —— 全分辨率频谱图，按当前显示设置（主题 / 显示域 / 感度或\n"
+            "          亮度截断 / 阶梯滤镜 / 音域裁剪）渲染出来的那一张，\n"
+            "          像素尺寸 = 帧数 × 当前显示的行数。\n"
+            "  .npz —— 分析数据：mag（未归一化线性幅度，原始量纲）、\n"
+            "          db（相对峰值，上限 0）、u8（当前显示设置下的色号），\n"
+            "          外加 time_s / midi / freq_hz 坐标轴与全部分析参数。\n"
+            "导出的都是**当前显示的那一张声道平面**，平面名写在元数据里。\n"
             "快捷键：Ctrl+E")
         self.act_export.setShortcut("Ctrl+E")
         self.act_export.triggered.connect(self.export_result_dialog)
@@ -406,8 +396,8 @@ class MainWindow(QMainWindow):
         self.act_spec_cfg.setToolTip(
             "打开谱面设置窗口，集中调整以下显示属性：\n"
             "  钢琴窗显示音域\n"
-            "  主题配色与显示域\n"
-            "  亮度滤镜\n"
+            "  主题配色 / 声道 / 显示域 / 感度\n"
+            "  亮度截断\n"
             "  小节线与节拍线\n"
             "各项修改即时预览，点「确定」后生效。")
         self.act_spec_cfg.triggered.connect(self.open_spectrum_settings)
@@ -486,6 +476,7 @@ class MainWindow(QMainWindow):
             "窗口内提供实时预览。")
         self.act_step_cfg.triggered.connect(self.open_filter_config)
         tb.addAction(self.act_step_cfg)
+
 
         tb.addSeparator()
 
@@ -700,8 +691,9 @@ class MainWindow(QMainWindow):
     def _apply_spectrum_settings(self, s):
         """把一份设置推到各个视图上。窗口里改一处就会走一次。
 
-        亮度滤镜在这里只负责同步滑块位置（静默），实际生效由
-        sld_hide.valueReleased -> _hide_timer -> _apply_hide_low 负责。
+        亮度截断的**阈值**由窗口按当前显示域算好放在 s["hide_low"] 里
+        （两个域的映射区间不同，见 SpectrumSettingsDialog.TRUNC_RANGE），
+        这里只负责落到频谱图上；volume_percent 仅用于同步对话框滑块位置。
         """
         lo = int(s.get("midi_min", MIDI_MIN))
         hi = int(s.get("midi_max", MIDI_MAX))
@@ -720,6 +712,11 @@ class MainWindow(QMainWindow):
         self.spec.set_bpm(float(s.get("bpm", self.spec.bpm)))
         self.spec.set_beats_per_bar(int(s.get("beats_per_bar", self.spec.beats_per_bar)))
         self.spec.set_show_beats(bool(s.get("show_beats", self.spec.show_beats)))
+        # 亮度截断阈值：以窗口算好的为准，别再拿百分比现算。立即生效 ——
+        # 滑块松手才发信号，所以"过渡值"根本不会进来。
+        if s.get("hide_low") is not None:
+            self.hide_low = float(s["hide_low"])
+            self._apply_hide_low()
         pct = s.get("volume_percent")
         if pct is not None:
             self._volume_percent = int(pct)
@@ -805,16 +802,23 @@ class MainWindow(QMainWindow):
         self._active_note = None
 
     def _on_hide_slider_changed(self, v):
-        """松手后才走到这里（ReleaseSlider 只发 valueReleased）。"""
+        """滑块松手（ReleaseSlider 只在松手时发 valueReleased）。
+
+        现在这条直连信号**只用于同步显示值**：阈值由「谱面设置」按当前显示域
+        算好、随 _apply_spectrum_settings 一起送过来并立即生效。窗口自己会走
+        同一条路，所以这里不再重复触发应用（重复只会多算一次）。
+        """
         self._volume_percent = int(v)
-        self._hide_timer.start()
 
     def _apply_hide_low(self):
-        v = self._volume_percent
-        new_val = v / 100.0
-        if abs(new_val - self.hide_low) < 1e-6:
+        """把当前阈值推给频谱图。
+
+        阈值本身由「谱面设置」窗口算好（它才知道当前显示域对应哪一段区间），
+        这里读缓存的 hide_low，不再拿百分比现算 —— 那样会把线性域的映射算错。
+        线性域里 spec.set_hide_low 只记录不重绘（那个域不参与截断）。
+        """
+        if abs(self.hide_low - self.spec.hide_low) < 1e-6:
             return
-        self.hide_low = new_val
         self.spec.set_hide_low(self.hide_low)
 
     def _on_clear_masks(self):
@@ -1268,10 +1272,14 @@ class MainWindow(QMainWindow):
             self._worker = None
 
     # ------------------------------------------------------------------
-    # 导出分析结果（数组）
+    # 导出（数据 / 渲染图）
     # ------------------------------------------------------------------
     def export_result_dialog(self):
-        """把最近一次分析结果导出成数组文件。"""
+        """导出分析结果。**导出什么由选的格式决定**：
+
+            npz  数据 —— mag / db / u8 + 坐标轴 + 全部元数据
+            png  全分辨率频谱图 —— 按当前显示设置渲染出来的那张图
+        """
         if self.db is None:
             QMessageBox.information(self, "无可导出数据", "请先打开并分析一个音频文件。")
             return
@@ -1281,26 +1289,97 @@ class MainWindow(QMainWindow):
             base = os.path.splitext(os.path.basename(self.current_path))[0]
         start = os.path.join(os.path.dirname(self.current_path or ""), base + ".npz")
 
-        flt = ("NumPy 压缩包 (*.npz);;NumPy 单数组 (*.npy);;"
-               "CSV 文本 (*.csv);;原始 float32 (*.bin);;所有文件 (*)")
-        path, chosen = QFileDialog.getSaveFileName(self, "导出分析结果（数组）", start, flt)
-        if not path:
+        # 用完整的 QFileDialog 而不是 getSaveFileName()，为的是解决一个 Qt 的老毛病：
+        # getSaveFileName 只返回"用户输入的字符串 + 选中哪个筛选器"，
+        # **切换筛选器时它不会动文件名里的后缀**。于是"选了 png、文件名还是 .npz"，
+        # 用户拿到一个后缀和内容不一致的文件。
+        #
+        # 双保险：
+        #   * filterSelected  —— 用户在对话框里切换筛选器时，当场把文件名后缀换掉，
+        #                        所见即所得。实测程序化 selectNameFilter 不触发它，
+        #                        所以它只管"用户在操作"这一路。
+        #   * 接受后归位      —— 不论中途发生什么，最终按**筛选器**把后缀换成
+        #                        正确的那一个。这一步是权威，不能省。
+        # 注意是**替换**后缀不是追加：/a/song.npz 选 png 要得到 /a/song.png，
+        # 而不是 /a/song.npz.png。
+        flt_png = "全分辨率频谱图 (*.png)"
+        flt_npz = "分析数据 (*.npz)"
+        dlg = QFileDialog(self, "导出（格式决定内容）", start,
+                          f"{flt_png};;{flt_npz}")
+        dlg.setAcceptMode(QFileDialog.AcceptSave)
+        dlg.setFileMode(QFileDialog.AnyFile)
+        dlg.setDefaultSuffix("png")          # 列表第一项，也是默认选项
+
+        def _as_ext(path, ext):
+            """把 path 的后缀换成 ext（没有后缀就补上）。"""
+            return os.path.splitext(path)[0] + ext
+
+        def _sync_suffix(selected):
+            ext = ".png" if "png" in str(selected) else ".npz"
+            dlg.setDefaultSuffix(ext.lstrip("."))
+            cur = dlg.selectedFiles()
+            if cur and os.path.splitext(cur[0])[1].lower() != ext:
+                dlg.selectFile(_as_ext(cur[0], ext))
+
+        dlg.filterSelected.connect(_sync_suffix)
+
+        if dlg.exec_() != QFileDialog.Accepted:
+            return
+        picked = dlg.selectedFiles()
+        if not picked:
+            return
+        path = picked[0]
+        # 筛选器是权威：用户明确选了哪种格式就导出哪种，后缀跟着它归位。
+        fmt = "png" if "png" in str(dlg.selectedNameFilter()) else "npz"
+        path = _as_ext(path, ".png" if fmt == "png" else ".npz")
+
+        # ---- PNG：用视图里已经上色好的那张图，不重算上色 ----
+        if fmt == "png":
+            # 注意用 export_qimage() 而不是 spec.qimg：
+            # 开了阶梯滤镜时 u8/qimg 是"一个半音一行"的**紧凑**形式（屏幕靠
+            # QPainter 纵向拉伸显示）。直接存紧凑形式，图高就只有半音数
+            # （88 而不是 1056），看着像"导出丢了行"。
+            # export_qimage() 先把紧凑行按 rows_per_semitone 复制回真实行数，
+            # 再按音域裁剪，得到与屏幕上完全一致的全分辨率结果。
+            get_img = getattr(self.spec, "export_qimage", None)
+            img = get_img() if callable(get_img) else getattr(self.spec, "qimg", None)
+            if img is None or img.isNull():
+                QMessageBox.information(
+                    self, "无可导出画面",
+                    "频谱图还没渲染出来（可能窗口尚未显示）。\n"
+                    "请先让主窗口把图画出来再导出。")
+                return
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                out = export_result(path, None, fmt, img=img)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "导出失败", f"{type(e).__name__}: {e}")
+                return
+            QApplication.restoreOverrideCursor()
+            h, w = img.height(), img.width()
+            # 把"每个半音占几行"写出来：图的像素高度直接由它决定，
+            # 用户看到"怎么只有 88 像素高"时，答案就在这里。
+            rps = int(self.params.get("rows_per_semitone",
+                                      DEFAULT_ROWS_PER_SEMITONE))
+            rows_note = (f"{h} 行（{rps} 行/半音）" if rps > 1
+                         else f"{h} 行（1 行/半音，即一个半音一行）")
+            self.lbl_left.setText(
+                f"已导出 {os.path.basename(out)}   ·   PNG   ·   "
+                f"{w} × {h} px = {w} 帧 × {rows_note}   ·   "
+                f"{self._file_size_text(out)}   ·   "
+                f"{midi_name(self.spec.midi_min)}–{midi_name(self.spec.midi_max)}")
+            # 分析分辨率低的时候提示一句，免得以为导出坏了
+            if rps <= 1:
+                self.lbl_center.setText(
+                    "提示：本次分析是 1 行/半音，图高即半音数；"
+                    "要更细的纵向分辨率请在「分析参数」里提高行/半音后重新分析")
+            else:
+                self.lbl_center.setText("")
             return
 
-        fmt = {"NumPy 压缩包 (*.npz)": "npz",
-               "NumPy 单数组 (*.npy)": "npy",
-               "CSV 文本 (*.csv)": "csv",
-               "原始 float32 (*.bin)": "raw(f32)"}.get(chosen)
-        if fmt is None:
-            ext = os.path.splitext(path)[1].lower()
-            fmt = {"npz": "npz", "npy": "npy", "csv": "csv",
-                   "bin": "raw(f32)", "raw": "raw(f32)", "f32": "raw(f32)"}.get(ext, "npz")
-        # 保证扩展名和格式一致，避免写出 .npz 后缀的 csv
-        want_ext = {"npz": ".npz", "npy": ".npy", "csv": ".csv", "raw(f32)": ".bin"}[fmt]
-        if not path.lower().endswith(want_ext):
-            path += want_ext
-
-        # mag 是未归一化的线性幅度（原始数据）；u8 只是显示用的量化结果。
+        # ---- NPZ：数据 ----
+        # mag 是未归一化的线性幅度（原始数据）；u8 是当前显示设置下的色号。
         # 导出的是**当前显示的那一张平面**，把它的名字一并写进元数据。
         mag = self.mag
         if mag is None:
@@ -1314,6 +1393,8 @@ class MainWindow(QMainWindow):
             source_path=self.current_path, hide_low=self.hide_low,
             colormap=getattr(self.spec, "cmap", None),
             u8=getattr(self.spec, "u8", None),
+            domain=getattr(self.spec, "domain", None),
+            sat_db=getattr(self.spec, "sat_db", None),
         )
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1325,17 +1406,20 @@ class MainWindow(QMainWindow):
             return
         QApplication.restoreOverrideCursor()
 
-        try:
-            size = os.path.getsize(out)
-            size_txt = (f"{size/1048576:.1f} MB" if size >= 1048576
-                        else f"{size/1024:.0f} KB")
-        except OSError:
-            size_txt = "?"
         n_frames, n_rows = self.db.shape
         self.lbl_left.setText(
-            f"已导出 {os.path.basename(out)}   ·   {fmt}   ·   "
-            f"{n_frames} 帧 × {n_rows} 行   ·   {size_txt}")
+            f"已导出 {os.path.basename(out)}   ·   NPZ   ·   "
+            f"{n_frames} 帧 × {n_rows} 行   ·   {self._file_size_text(out)}")
         self.lbl_center.setText("")
+
+    @staticmethod
+    def _file_size_text(path):
+        """把字节数写成人看的大小。取不到就返回 '?'。"""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return "?"
+        return f"{size/1048576:.1f} MB" if size >= 1048576 else f"{size/1024:.0f} KB"
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():

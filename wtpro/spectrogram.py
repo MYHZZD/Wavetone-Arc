@@ -5,7 +5,9 @@ import math
 import numpy as np
 
 from wtpro import backends
-from wtpro.color import DEFAULT_WT_SAT_DB, LUTS, LUTS_RGB, WT_SAT_DB_MAX, WT_SAT_DB_MIN
+from wtpro.color import (
+    LUTS, LUTS_RGB, WT_SAT_DB_MAX, WT_SAT_DB_MIN, wt_default_linear_sat_db
+)
 from wtpro.common import (
     BLACK_PC, DB_FLOOR, DEFAULT_ROWS_PER_SEMITONE, DISPLAY_GAMMA, MASK_MIN_DRAG_PX,
     MIDI_MAX, MIDI_MIN, _num_opt, chord_note_set, midi_name, midi_to_freq, midi_to_y,
@@ -217,7 +219,7 @@ class SpectrogramView(QWidget):
         self.rgb_lut = LUTS_RGB[self.cmap]
         self.hide_low = 0.0
         self.domain = "db"                      # db | linear（linear 复刻 WaveTone）
-        self.sat_db = DEFAULT_WT_SAT_DB          # 线性域的饱和起点
+        self.sat_db = wt_default_linear_sat_db()   # 线性域的感度（dB 刻度）
         # 当前显示哪一张声道平面（stereo | l | r）。数据由主窗口在切换时
         # 通过 set_data 推进来，这里只记录"现在看的是哪一张"，供状态栏与
         # 谱面设置窗口读回。
@@ -400,10 +402,11 @@ class SpectrogramView(QWidget):
         self._invalidate_bg()
 
     def set_sat_db(self, sat_db):
-        """设置线性域的饱和起点（dB）。不改数据，只重算上色。"""
-        sat = _num_opt(sat_db, DEFAULT_WT_SAT_DB)
+        """设置线性域的感度（以 dB 刻度表示）。不改数据，只重算上色。"""
+        default = wt_default_linear_sat_db()
+        sat = _num_opt(sat_db, default)
         if not math.isfinite(sat):
-            sat = DEFAULT_WT_SAT_DB
+            sat = default
         sat = max(WT_SAT_DB_MIN, min(WT_SAT_DB_MAX, sat))
         if abs(sat - self.sat_db) < 1e-9:
             return
@@ -419,15 +422,90 @@ class SpectrogramView(QWidget):
         中间区域会自动被拉高，其余绘制逻辑一行都不用改 —— 它们都是通过
         midi_to_y / y_to_midi 用 midi_min/midi_max 换算的。
         """
-        if self.u8 is None:
+        img = self._full_qimg()
+        if img is None:
             self.qimg = None
             return
-        full = u8_to_qimage_fast(self.u8, self.rgb_lut)
-        lo, hi = self._visible_row_span()
-        if lo == 0 and hi == full.height():
-            self.qimg = full
+        span = self._full_span()
+        if span is None:
+            self.qimg = img
             return
-        self.qimg = full.copy(0, lo, full.width(), max(1, hi - lo))
+        lo, hi = span
+        if lo == 0 and hi == img.height():
+            self.qimg = img
+            return
+        self.qimg = img.copy(0, lo, img.width(), max(1, hi - lo))
+
+    def _expanded_u8(self):
+        """把**紧凑**的 u8 纵向复制回"真实行数"。
+
+        阶梯滤镜开启时 `_display_db` 会走紧凑路径，u8 是"一个半音一行"
+        （n_rows // rows_per_semitone 行）。屏幕上没问题 —— QPainter 会把
+        每一行纵向拉满，肉眼看到的就是每半音占 rows_per_semitone 行。
+
+        但**导出 PNG 必须还原**：紧凑形式直接存成图，高度就只有半音数
+        （88 而不是 1056），用户看到的是"导出丢了行"。这里按 rows_per_semitone
+        逐行复制，得到与屏幕上完全一致的全分辨率结果。
+
+        没开阶梯滤镜（或没走紧凑路径）时原样返回。
+        """
+        if self.u8 is None:
+            return None
+        if not self._compact_bands():
+            return self.u8
+        rps = max(1, int(self.rows_per_semitone))
+        h = self.u8.shape[1]
+        used = h * rps
+        if used >= self.n_rows:
+            # 正好（或已超过）：直接铺开，末尾多余的行由下面的裁剪切掉
+            return np.repeat(self.u8, rps, axis=1)[:, :self.n_rows]
+        # 末尾不足一个半音的行：按最后一行的值补齐，与 semitone_step_filter
+        # 的收尾方式一致
+        out = np.empty((self.u8.shape[0], self.n_rows), dtype=self.u8.dtype)
+        out[:, :used] = np.repeat(self.u8, rps, axis=1)
+        out[:, used:] = self.u8[:, -1:]
+        return out
+
+    def _full_qimg(self):
+        """未经音域裁剪的 QImage。展开后的高度与 semitone_step_filter 的
+        "铺回 n_rows" 完全一致（同样的 used / 收尾规则）。"""
+        u8 = self._expanded_u8()
+        if u8 is None:
+            return None
+        return u8_to_qimage_fast(np.ascontiguousarray(u8), self.rgb_lut)
+
+    def _full_span(self):
+        """在**展开后**的高度坐标系里的可见行区间 [lo, hi)。
+
+        与 `_visible_row_span` 的区别：这里一律按真实行数（每半音
+        rows_per_semitone 行）算，因为展开后的图就是那个高度。
+        返回 None 表示不需要裁剪（正好是全高）。
+        """
+        if self.u8 is None:
+            return None
+        rps = max(1, int(self.rows_per_semitone))
+        h = max(1, int(self.n_rows))
+        top = MIDI_MAX - int(self.midi_max)
+        bottom = MIDI_MAX - int(self.midi_min) + 1
+        lo = max(0, min(h, top * rps))
+        hi = max(lo + 1, min(h, bottom * rps))
+        if lo == 0 and hi == h:
+            return None
+        return lo, hi
+
+    def export_qimage(self):
+        """给导出用的全分辨率渲染图：阶梯滤镜的紧凑行已复制回真实行数，
+        并按当前音域左右上下裁剪到可见范围。"""
+        img = self._full_qimg()
+        if img is None:
+            return None
+        span = self._full_span()
+        if span is None:
+            return img
+        lo, hi = span
+        if lo == 0 and hi == img.height():
+            return img
+        return img.copy(0, lo, img.width(), max(1, hi - lo))
 
     def _qimg_frames(self):
         """当前 QImage 覆盖的帧数。
@@ -476,13 +554,20 @@ class SpectrogramView(QWidget):
         self._invalidate_bg()
 
     def set_hide_low(self, v):
+        """设置亮度截断阈值。
+
+        **只有 dB 域才需要重算显示**：线性域里这个阈值不参与映射（那个滑块在
+        线性域控制的是感度），可是它仍然会被赋值/清零。如果照旧无条件重算，就会
+        出现"用户改的是感度、画面却在一个延迟之后又跳一下"——那次跳变是这里
+        重算出来的，值本身没变。所以线性域只记下数值、等切回 dB 域时再用。
+        """
         v = float(v)
         if abs(v - self.hide_low) < 1e-6:
             return
         self.hide_low = v
-        if self.db is not None:
+        if self.db is not None and self.domain != "linear":
             self._regen_u8()
-        self._invalidate_bg()
+            self._invalidate_bg()
 
     def set_step_filter(self, on):
         """半音内取平均的阶梯滤镜。只影响显示，不动分析结果。"""
@@ -511,6 +596,7 @@ class SpectrogramView(QWidget):
                 print(f"[filter] 阶梯滤镜失败: {type(e).__name__}: {e}")
                 self._step_cache = self.db
         return self._step_cache
+
 
     def set_step_config(self, cfg):
         """更新阶梯滤镜参数并重算（预览用）。"""

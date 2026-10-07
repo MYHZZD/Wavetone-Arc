@@ -377,11 +377,14 @@ def samples_to_wav_bytes(samples, sr):
 
 
 def export_payload(mag, db, hop, sr, params=None, source_path=None,
-                   hide_low=None, colormap=None, u8=None):
+                   hide_low=None, colormap=None, u8=None, domain=None,
+                   sat_db=None):
     """组装一份自描述的导出数据。
 
     mag : (n_frames, n_rows) float32，线性幅度，行 0 = MIDI_MAX
     db  : 同一形状的 dB（相对峰值，上限 0），便于直接画图
+    u8  : 按当前显示设置上色后的色号（仅 npz 一并存下，便于复现画面）
+    domain / sat_db / hide_low / colormap 一起记录"这张 u8 是怎么来的"。
     """
     p = params or {}
     n_frames, n_rows = mag.shape
@@ -400,7 +403,7 @@ def export_payload(mag, db, hop, sr, params=None, source_path=None,
         "time_s": times,
         "midi": midis,
         "freq_hz": freqs,
-        # ---- 元数据（npz 里存成 0 维数组，csv 里写注释头）----
+        # ---- 元数据（npz 里存成 0 维数组）----
         "sr": int(sr),
         "hop": int(hop),
         "fps": float(sr) / float(hop),
@@ -414,6 +417,9 @@ def export_payload(mag, db, hop, sr, params=None, source_path=None,
         "channel_plane": str(p.get("channel_plane", "stereo")),
         "channel_mode": str(p.get("channel_mode", "stereo_only")),
         "db_floor": float(DB_FLOOR),
+        # 显示设置：u8 只在同一套设置下才有意义，必须连它一起记
+        "domain": ("" if domain is None else str(domain)),
+        "sat_db": ("" if sat_db is None else float(sat_db)),
         "hide_low": ("" if hide_low is None else float(hide_low)),
         "colormap": ("" if colormap is None else str(colormap)),
         "duration_s": float(n_frames * hop) / float(sr),
@@ -424,56 +430,50 @@ def export_payload(mag, db, hop, sr, params=None, source_path=None,
 
 
 
-def export_result(path, payload, fmt=None):
-    """把 payload 写到 path。fmt 为空时按扩展名推断。返回实际写入的路径。"""
+def export_result(path, payload, fmt=None, img=None):
+    """把导出内容写到 path。fmt 为空时按扩展名推断。返回实际写入的路径。
+
+    只支持两种格式，**由文件格式决定导出什么**：
+
+        npz   数据 —— mag / db / u8 三个数组 + 坐标轴 + 全部元数据
+        png   全分辨率频谱图 —— 按当前显示设置渲染出来的那张图
+
+    img 只在 png 时用到，是 wtpro.render.u8_to_qimage_fast 造出来的 QImage。
+    handler 表里没有的格式一律抛 ValueError，不做静默兜底 —— 静默兜底正是
+    "用户以为导出了图、其实拿到一坨数组"这种事的来源。
+    """
     path = str(path)
     if fmt is None:
         ext = os.path.splitext(path)[1].lower().lstrip(".")
-        fmt = {"npz": "npz", "npy": "npy", "csv": "csv",
-               "bin": "raw(f32)", "raw": "raw(f32)", "f32": "raw(f32)"}.get(ext, "npz")
+        fmt = {"npz": "npz", "png": "png"}.get(ext, "npz")
+    fmt = str(fmt).lower()
+
+    # PNG 先分派：它只用 img，payload 传 None 也合法（调用方不必为了导图
+    # 去凑一份数据 payload）。
+    if fmt == "png":
+        if img is None:
+            raise ValueError("PNG 导出需要一张已渲染的图（img 为空）")
+        if not img.save(path, "PNG"):
+            raise OSError(f"写入 PNG 失败: {path}")
+        return path
+
+    if fmt != "npz":
+        raise ValueError(f"未知导出格式: {fmt}（只支持 npz / png）")
+    if not payload:
+        raise ValueError("NPZ 导出需要数据 payload")
+
     mag = payload["mag"]
     db = payload["db"]
     meta = {k: v for k, v in payload.items()
             if k not in ("mag", "db", "u8") and not isinstance(v, np.ndarray)}
 
-    if fmt == "npz":
-        arrays = {"mag": mag, "db": db,
-                  "time_s": payload["time_s"], "midi": payload["midi"],
-                  "freq_hz": payload["freq_hz"]}
-        if payload.get("u8") is not None:
-            arrays["u8"] = payload["u8"]
-        np.savez_compressed(path, **arrays, **meta)
-        return path
-
-    if fmt == "npy":
-        np.save(path, mag)
-        return path
-
-    if fmt == "raw(f32)":
-        mag.astype("<f4").tofile(path)
-        return path
-
-    if fmt == "csv":
-        # 头部注释带元数据，之后第一列是时间，其余列按中音号命名
-        lines = ["# wavetonepro export",
-                 f"# shape(n_frames,n_rows)={db.shape[0]},{db.shape[1]}",
-                 f"# rows_are={payload['rows_are']}"]
-        for k in sorted(meta):
-            lines.append(f"# {k}={meta[k]}")
-        hdr = ["time_s"] + [f"midi{m:.3f}" for m in payload["midi"]]
-        lines.append(",".join(hdr))
-        t = payload["time_s"]
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write("\n".join(lines) + "\n")
-            block = max(1, 200000 // max(1, db.shape[1]))
-            for i in range(0, db.shape[0], block):
-                sub = db[i:i + block]
-                for j in range(sub.shape[0]):
-                    f.write(f"{t[i + j]:.6f}," +
-                            ",".join(f"{v:.3f}" for v in sub[j]) + "\n")
-        return path
-
-    raise ValueError(f"未知导出格式: {fmt}")
+    arrays = {"mag": mag, "db": db,
+              "time_s": payload["time_s"], "midi": payload["midi"],
+              "freq_hz": payload["freq_hz"]}
+    if payload.get("u8") is not None:
+        arrays["u8"] = payload["u8"]
+    np.savez_compressed(path, **arrays, **meta)
+    return path
 
 
 

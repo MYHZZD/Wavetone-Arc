@@ -3,6 +3,8 @@
 本层只产出线性幅度，不涉及 dB、配色或显示域。"""
 
 import math
+import os
+import time
 
 import numpy as np
 
@@ -24,6 +26,21 @@ def _xp():
     所以不能在这里做成模块级常量，必须每次现取。
     """
     return backends.xp
+
+
+def _sync():
+    """同步当前后端。CPU 上是空操作；GPU 上必须有它，否则计时只量到下发。
+
+    计时不准比没有计时更糟 —— 只有下发时间的话，会得出"GPU 比 CPU 快百倍"
+    这种荒谬结论。
+    """
+    xp = backends.xp
+    if xp is np:
+        return
+    try:
+        xp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
 
 _WINDOW_CACHE = {}
 
@@ -576,19 +593,34 @@ def _compute_reassigned_locked(
             pass
 
     cancelled = False
-    for m_start, m_end, N, hop_g, k_lo, k_hi, starts, band_lo, band_hi in plans:
+    # 分阶段计时（只在 WAVETONEPRO_TIMING=1 时打印）。
+    # 为什么需要它：CPU 与 GPU 的"贵"在哪一段完全不同 ——
+    # GPU 上 FFT 很快，但**每组的 _splat_group_to_common 与反复的小 kernel
+    # 下发**会成为瓶颈；CPU 上则是 FFT 本身。没有分阶段的数字就只能猜。
+    _timing = os.environ.get("WAVETONEPRO_TIMING", "") not in ("", "0")
+    _t_stft = _t_reassign = _t_splat = 0.0
+    if _timing:
+        print(f"[timing] 后端 {backends.GPU_NAME}  音频 {n} 样本"
+              f"（{n/float(sr):.2f}s）  组数 {len(plans)}  分块 {total_chunks}  "
+              f"公共帧 {n_common}  base_hop {base_hop}  行 {n_rows}", flush=True)
+    for gi, (m_start, m_end, N, hop_g, k_lo, k_hi, starts, band_lo, band_hi) \
+            in enumerate(plans):
         if not starts:
             continue
 
         ratio = max(1, int(hop_g // base_hop))
         n_g_frames = n // hop_g + 1
+        if _timing:
+            print(f"[timing] 组 {gi+1}/{len(plans)}  MIDI {midi_name(m_start)}"
+                  f"–{midi_name(m_end)}  N={N}  hop={hop_g}  ratio={ratio}  "
+                  f"组帧 {n_g_frames}  分块 {len(starts)}", flush=True)
 
         group_grid = _xp().zeros((n_g_frames, n_rows), dtype=F32)
         window_xp = get_window(N)
         n_bins = N // 2 + 1
         f_k_xp = _xp().arange(n_bins, dtype=_xp().float64) * (float(sr) / float(N))
 
-        for i0, i1 in starts:
+        for ci, (i0, i1) in enumerate(starts):
             if cancel_cb is not None:
                 try:
                     if cancel_cb():
@@ -597,7 +629,15 @@ def _compute_reassigned_locked(
                 except Exception:
                     pass
 
+            _t0 = time.perf_counter()
             X = _stft_batch(samples_xp, N, hop_g, i0, i1, window_xp)
+            if _timing:
+                _sync()
+                _d = time.perf_counter() - _t0
+                _t_stft += _d
+                print(f"[timing]   STFT      块 {ci+1}/{len(starts)}  "
+                      f"{_d:8.3f}s  X{X.shape}", flush=True)
+            _t0 = time.perf_counter()
             _reassign_chunk(
                 X,
                 N,
@@ -616,6 +656,12 @@ def _compute_reassigned_locked(
                 band_hi=band_hi,
                 interp=interp,
             )
+            if _timing:
+                _sync()
+                _d = time.perf_counter() - _t0
+                _t_reassign += _d
+                print(f"[timing]   重分配    块 {ci+1}/{len(starts)}  "
+                      f"{_d:8.3f}s", flush=True)
             del X
 
             done_chunks += 1
@@ -628,12 +674,38 @@ def _compute_reassigned_locked(
         if cancelled:
             break
 
+        _t0 = time.perf_counter()
         _splat_group_to_common(group_grid, ratio, out_xp, n_common,
                                interp=interp)
+        if _timing:
+            _sync()
+            _d = time.perf_counter() - _t0
+            _t_splat += _d
+            print(f"[timing]   组间插值  {_d:8.3f}s  ratio={ratio}", flush=True)
         del group_grid
 
     if cancelled:
         raise AnalysisCancelled()
+
+    if _timing:
+        _t0 = time.perf_counter()
+        if backends.HAS_GPU:
+            out_np = _xp().asnumpy(out_xp).astype(F32, copy=False)
+        else:
+            out_np = np.asarray(out_xp, dtype=F32)
+        _t_copy = time.perf_counter() - _t0
+        _total = _t_stft + _t_reassign + _t_splat + _t_copy
+        print(f"[timing] 后端 {backends.GPU_NAME}  "
+              f"音频 {n} 样本（{n/float(sr):.2f}s）  输出 {out_np.shape}")
+        print(f"[timing]   STFT        {_t_stft:8.3f}s  {100*_t_stft/max(_total,1e-9):5.1f}%")
+        print(f"[timing]   重分配      {_t_reassign:8.3f}s  {100*_t_reassign/max(_total,1e-9):5.1f}%")
+        print(f"[timing]   组间插值    {_t_splat:8.3f}s  {100*_t_splat/max(_total,1e-9):5.1f}%")
+        print(f"[timing]   回传 CPU    {_t_copy:8.3f}s  {100*_t_copy/max(_total,1e-9):5.1f}%")
+        print(f"[timing]   合计        {_total:8.3f}s"
+              f"  ({n/float(sr)/max(_total,1e-9):.0f} 倍实时)")
+        print(f"[timing]   组数 {len(plans)}  分块 {total_chunks}  "
+              f"公共帧 {n_common}  base_hop {base_hop}")
+        return out_np, base_hop
 
     if backends.HAS_GPU:
         out_np = _xp().asnumpy(out_xp).astype(F32, copy=False)

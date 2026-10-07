@@ -1,12 +1,10 @@
 """各类设置对话框：分析参数、阶梯滤镜、谱面设置、和弦编辑。"""
 
-import math
-
 import numpy as np
 
 from wtpro import backends
 from wtpro.color import (
-    COLORMAP_CHOICES, DEFAULT_WT_SAT_DB, SAT_SLIDER_SCALE, WT_SAT_DB_MAX, WT_SAT_DB_MIN
+    COLORMAP_CHOICES, wt_default_linear_sat_db, wt_sat_db_to_sense, wt_sense_to_sat_db
 )
 from wtpro.common import (
     BLACK_PC, CUSTOM_CHORD_HI, CUSTOM_CHORD_LO, DEFAULT_CHANNEL_MODE,
@@ -931,59 +929,48 @@ class SpectrumSettingsDialog(QDialog):
             "        动态范围完整呈现，低声压级内容（如背景噪声）同样可见，\n"
             "        观感接近 Audacity 一类工具。\n"
             "线性幅度：直接以线性幅度映射，全程不作对数运算，为 WaveTone 的\n"
-            "        原版行为。映射为指数关系，其饱和起点由下方的「饱和起点」\n"
-            "        滑块设定；低于该起点的内容迅速衰减至调色板下端。\n"
+            "        原版行为。映射为指数关系，整体增益由下方的「感度」滑块设定；\n"
+            "        低于该增益的内容迅速衰减至调色板下端。\n"
             "        典型效果为暗场近乎纯黑、峰值区域成片饱和，对比强烈。")
         fl.addRow("显示域", self.cb_domain)
 
-        # 线性域的饱和起点：比它响的部分一律顶格
-        self.sld_sat = ReleaseSlider(Qt.Horizontal, self)
-        self.sld_sat.setRange(int(round(WT_SAT_DB_MIN * SAT_SLIDER_SCALE)),
-                              int(round(WT_SAT_DB_MAX * SAT_SLIDER_SCALE)))
-        self.sld_sat.setToolTip(
-            "线性幅度域的饱和起点：高于该电平的部分一律取调色板上限（饱和），\n"
-            "低于该电平的部分按指数关系迅速衰减至调色板下端。\n"
-            "调整方向：\n"
-            "  向左（更负）：饱和范围扩大，亮部连成一片，层次减少。\n"
-            "  向右（趋近 0 dB）：仅峰值附近饱和，画面转暗，谱线更锐利。\n"
-            "默认 -22.1 dB（精确值 -22.1321 dB）对应 WaveTone 的固定增益 12.78，\n"
-            "即其末级 min(191, raw×G>>10) 的截断门限，故默认取值即正版观感。\n"
-            "该参数仅在显示域为「线性幅度」时生效。")
-        row_sat = QHBoxLayout()
-        row_sat.setContentsMargins(0, 0, 0, 0)
-        row_sat.addWidget(self.sld_sat, 1)
-        self.lbl_sat_local = QLabel("")
-        self.lbl_sat_local.setMinimumWidth(52)
-        self.lbl_sat_local.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.lbl_sat_local.setStyleSheet(
-            "color:#9fc5ff;font-family:Consolas,Menlo,monospace;")
-        row_sat.addWidget(self.lbl_sat_local)
-        fl.addRow("饱和起点", row_sat)
-
-        # 亮度滤镜滑块。**必须由对话框自己创建**：
-        # 它天生以对话框为 parent，窗口关闭时不会被顺手删掉（deleteLater 只删
-        # 对话框本身，子控件会被 parent 机制留下），主窗口可以放心继续持有它。
-        # 反过来把工具栏的滑块 addWidget 进来则会被重设 parent 到对话框，
-        # 窗口一关对象就没了 —— 那正是之前 RuntimeError 的原因。
+        # 显示 / 亮度：**一个滑块，两个域各干一件事**。
+        #
+        #   dB 域  ：亮度截断 —— 低于阈值的压到最低色号（0~100% → 阈值 0~1）
+        #   线性域 ：感度     —— 整体增益（0~100% → 感度 30~60，35% 即 40.5）
+        #
+        # 为什么不共用一套换算：线性域的归一化幅度低处密集，把 dB 域那套阈值
+        # 直接搬过去几乎没有可见效果，用户实测后给的可用区间就是感度 30~60。
+        # 所以这里不是"换算"，而是两个域各自独立的一段映射，滑块位置是共享的。
+        #
+        # **必须由对话框自己创建**：它天生以对话框为 parent，窗口关闭时不会被
+        # 顺手删掉（deleteLater 只删对话框本身，子控件会被 parent 机制留下），
+        # 主窗口可以放心继续持有它。反过来把工具栏的滑块 addWidget 进来则会被
+        # 重设 parent 到对话框，窗口一关对象就没了 —— 那正是之前 RuntimeError 的原因。
         self.sld_hide = ReleaseSlider(Qt.Horizontal, self)
         self.sld_hide.setRange(0, 100)
         self.sld_hide.setToolTip(
-            "亮度滤镜：作完显示域映射后，把低于指定比例的电平统一映射到调色板\n"
-            "下端（0% 保持原始映射范围不变）。\n"
-            "调整后各域的等效门限不同（下文按默认饱和起点 -22.1321 dB 计算）：\n"
-            "  dB 域：0% → -100 dB，35% → -65 dB，100% → 0 dB。\n"
-            "  线性幅度：0% → -70.3 dB，35% → -31.3 dB，100% → -22.1 dB。\n"
-            "可见切换显示域会改变该滑块的等效作用深度。")
+            "一个滑块，两个显示域各控制一件事：\n"
+            "  dB 域  ：亮度截断 —— 设一个阈值，低于它的内容一律压到调色板\n"
+            "          最低色号。0% 不截断，100% 只剩峰值附近。\n"
+            "  线性幅度：感度 —— 整体增益，刻度取自 WaveTone 的\n"
+            "          显示亮度 = min(上限, 幅度 × 感度增益)。往右更亮，\n"
+            "          中等电平也顶到上限，亮部连成一片。\n"
+            "两个域的映射区间：\n"
+            "  dB 域  ：显示 0~100%  →  阈值 0.00 ~ 1.00（35% 即 0.35）\n"
+            "  线性幅度：显示 0~100%  →  感度 30 ~ 60（35% 即 40.5）\n"
+            "切换显示域时滑块位置不变，但作用的对象换成对应域的那一个。")
         row_hide = QHBoxLayout()
         row_hide.setContentsMargins(0, 0, 0, 0)
         row_hide.addWidget(self.sld_hide, 1)
         self.lbl_hide_local = QLabel("")
-        self.lbl_hide_local.setMinimumWidth(38)
+        self.lbl_hide_local.setMinimumWidth(56)
         self.lbl_hide_local.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.lbl_hide_local.setStyleSheet(
             "color:#9fc5ff;font-family:Consolas,Menlo,monospace;")
         row_hide.addWidget(self.lbl_hide_local)
-        fl.addRow("亮度滤镜", row_hide)
+        fl.addRow("显示 / 亮度", row_hide)
+
         root.addRow(grp_look)
 
         # ---------------- 小节线 ----------------
@@ -1023,7 +1010,7 @@ class SpectrumSettingsDialog(QDialog):
         self.btn_reset = QPushButton("恢复默认")
         self.btn_reset.setToolTip(
             "把本窗口的全部选项恢复为初始值：全键盘音域、magma 主题、\n"
-            "dB 域、亮度滤镜 35%、启用节拍线、BPM 120、每小节 4 拍。")
+            "dB 域、亮度截断 35%、启用节拍线、BPM 120、每小节 4 拍。")
         btns.addButton(self.btn_reset, QDialogButtonBox.ResetRole)
         self.btn_reset.clicked.connect(self._on_reset)
         btns.accepted.connect(self.accept)
@@ -1040,19 +1027,36 @@ class SpectrumSettingsDialog(QDialog):
         # 分析模式决定声道下拉框的候选；s 里没有就问主窗口要，再没有就用默认
         self._mode = s.get("channel_mode", DEFAULT_CHANNEL_MODE)
         self._sync_channel_combo(keep=s.get("channel_plane"))
-        self.sld_sat.setValueSilently(
-            self._sat_db_to_slider(s.get("sat_db", DEFAULT_WT_SAT_DB)))
         self.chk_beats.setChecked(bool(s.get("show_beats", True)))
         self.sp_bpm.setValue(float(s.get("bpm", 120.0)))
         self.sp_bpb.setValue(int(s.get("beats_per_bar", 4)))
-        self.sld_hide.setValueSilently(int(s.get("volume_percent", 35)))
+        # 滑块位置从当前域对应的那个量反算：
+        #   dB 域  -> 亮度截断阈值（0~1）
+        #   线性域 -> 感度
+        if self._is_linear():
+            sense = wt_sat_db_to_sense(
+                _num_opt(s.get("sat_db"), wt_default_linear_sat_db()))
+            pct = int(round(self._sense_to_slider(sense)))
+        elif s.get("hide_low") is not None:
+            pct = int(round(self._trunc_value_to_display(s["hide_low"])))
+        else:
+            pct = int(s.get("volume_percent", 35))
+        self.sld_hide.setValueSilently(max(0, min(100, pct)))
         if not has_data:
             grp_look.setEnabled(False)
             grp_beat.setEnabled(False)
         self._loading = False
 
+        # 显示域一变，滑块位置**保持不变**（这是用户的预期：位置是共享的），
+        # 但作用的对象换成对应域的那一个，所以标签与应用值都要刷新。
+        def _on_domain_changed(*_a):
+            if self._loading:
+                return
+            self._on_volume_label()
+            self._apply()
+
         self.cb_cmap.currentIndexChanged.connect(self._apply)
-        self.cb_domain.currentIndexChanged.connect(self._apply)
+        self.cb_domain.currentIndexChanged.connect(_on_domain_changed)
         self.cb_channel.currentIndexChanged.connect(self._apply)
         self.chk_beats.toggled.connect(self._apply)
         self.sp_bpm.valueChanged.connect(self._apply)
@@ -1064,12 +1068,9 @@ class SpectrumSettingsDialog(QDialog):
         # 数值标签实时跟手，重算等松手（valueReleased）
         self.sld_hide.valueChanged.connect(self._on_volume_label)
         self.sld_hide.valueReleased.connect(self._on_volume_released)
-        self.sld_sat.valueChanged.connect(self._on_sat_label)
-        self.sld_sat.valueReleased.connect(self._on_sat_released)
 
         self._refresh_key_labels()
-        self._on_volume_label(self.sld_hide.value())
-        self._on_sat_label(self.sld_sat.value())
+        self._on_volume_label()
         self._sync_enabled()
         self.resize(480, self.sizeHint().height())
 
@@ -1124,27 +1125,6 @@ class SpectrumSettingsDialog(QDialog):
         self._sync_channel_combo(keep=self.cb_channel.currentData())
         self._apply()
 
-    # ---------------- 饱和起点 ----------------
-    def _sat_db_to_slider(self, sat_db):
-        """饱和起点(dB) → 滑块整数，并夹到量程内。"""
-        sat = _num_opt(sat_db, DEFAULT_WT_SAT_DB)
-        if not math.isfinite(sat):
-            sat = DEFAULT_WT_SAT_DB
-        sat = max(WT_SAT_DB_MIN, min(WT_SAT_DB_MAX, sat))
-        return int(round(sat * SAT_SLIDER_SCALE))
-
-    def _sat_db(self):
-        return self.sld_sat.value() / float(SAT_SLIDER_SCALE)
-
-    def _on_sat_label(self, _v=None):
-        """拖动中只更新数字，不做任何重算。"""
-        self.lbl_sat_local.setText(f"{self._sat_db():.1f} dB")
-
-    def _on_sat_released(self, _v=None):
-        """松手后才真正应用。"""
-        self._on_sat_label()
-        self._apply()
-
     # ---------------- 音域 ----------------
     def _key_pair(self):
         return int(self.sld_key_lo.value()), int(self.sld_key_hi.value())
@@ -1185,14 +1165,64 @@ class SpectrumSettingsDialog(QDialog):
         on = self.chk_beats.isChecked()
         self.sp_bpm.setEnabled(on)
         self.sp_bpb.setEnabled(on)
-        # 饱和起点只对线性幅度域有意义
-        sat_on = self.cb_domain.currentData() == "linear"
-        self.sld_sat.setEnabled(sat_on)
-        self.lbl_sat_local.setEnabled(sat_on)
 
-    def _on_volume_label(self, v):
+    # ---------------- 显示 / 亮度：一个滑块，两个域 ----------------
+    # 滑块位置（0~100%）在两个域里映射到**两件不同的事**：
+    #
+    #     dB 域  ：亮度截断阈值  0 ~ 1      （35% 即 0.35，与原有行为一致）
+    #     线性域 ：感度（增益）  30 ~ 60     （35% 即 40.5）
+    #
+    # 两者不是换算关系，而是各自一段映射 —— 线性域把旧的亮度截断换成感度，
+    # 因为同一份归一化阈值在低处密集的线性域里几乎看不出效果。
+    #
+    # 滑块位置是**唯一权威**：线性域一打开就用 35%（感度 40.5），不再有
+    # "先显示旧标定值、动一下才换过来"的中间状态 —— 感度 100 那档本来就
+    # 过曝，留着只会让人以为默认是它。
+    TRUNC_RANGE = (0.0, 1.0)        # dB 域的亮度截断阈值区间
+    SENSE_RANGE = (30.0, 60.0)      # 线性域的感度区间
+
+    def _is_linear(self):
+        return (self.cb_domain.currentData() or "db") == "linear"
+
+    def _slider_to_sense(self, pct):
+        """滑块 0~100% → 线性域的感度。"""
+        lo, hi = self.SENSE_RANGE
+        return lo + (hi - lo) * (max(0.0, min(100.0, float(pct))) / 100.0)
+
+    def _sense_to_slider(self, sense):
+        """感度 → 滑块 0~100%（上面那个映射的逆）。"""
+        lo, hi = self.SENSE_RANGE
+        span = hi - lo
+        if span <= 1e-9:
+            return 0.0
+        pct = (float(sense) - lo) / span * 100.0
+        return max(0.0, min(100.0, pct))
+
+    def _trunc_display_to_value(self, pct):
+        """滑块 0~100% → dB 域的亮度截断阈值。"""
+        lo, hi = self.TRUNC_RANGE
+        return lo + (hi - lo) * (max(0.0, min(100.0, float(pct))) / 100.0)
+
+    def _trunc_value_to_display(self, value):
+        """亮度截断阈值 → 滑块 0~100%。"""
+        lo, hi = self.TRUNC_RANGE
+        span = hi - lo
+        if span <= 1e-9:
+            return 0.0
+        pct = (float(value) - lo) / span * 100.0
+        return max(0.0, min(100.0, pct))
+
+    def _slider_to_sat_db(self, pct):
+        return wt_sense_to_sat_db(self._slider_to_sense(pct))
+
+    def _on_volume_label(self, v=None):
         """拖动中只更新数字，不做任何重算。"""
-        self.lbl_hide_local.setText(f"{v}%")
+        if v is None:
+            v = self.sld_hide.value()
+        if self._is_linear():
+            self.lbl_hide_local.setText(f"感度 {self._slider_to_sense(v):.1f}")
+        else:
+            self.lbl_hide_local.setText(f"{int(v)}%")
 
     def _on_volume_released(self, v):
         """松手后才真正应用。"""
@@ -1201,6 +1231,8 @@ class SpectrumSettingsDialog(QDialog):
 
     def get_settings(self):
         lo, hi = self._key_pair()
+        pct = self.sld_hide.value()
+        linear = self._is_linear()
         out = {
             "midi_min": lo,
             "midi_max": hi,
@@ -1208,11 +1240,16 @@ class SpectrumSettingsDialog(QDialog):
             "domain": self.cb_domain.currentData(),
             "channel_plane": self._current_channel_plane(),
             "channel_mode": self._channel_mode(),
-            "sat_db": self._sat_db(),
+            # 线性域：感度 —— 滑块位置就是权威值
+            "sat_db": self._slider_to_sat_db(pct),
             "show_beats": bool(self.chk_beats.isChecked()),
             "bpm": float(self.sp_bpm.value()),
             "beats_per_bar": int(self.sp_bpb.value()),
-            "volume_percent": int(self.sld_hide.value()),
+            "volume_percent": int(pct),
+            # dB 域：亮度截断阈值 —— 由滑块位置定。
+            # 线性域**不参与截断**（那个滑块在线性域控制的是感度），必须给 0，
+            # 否则会跟着滑块位置算出一个阈值，延迟一拍作用上去造成"变了两次"。
+            "hide_low": (self._trunc_display_to_value(pct) if not linear else 0.0),
         }
         return out
 
@@ -1230,13 +1267,11 @@ class SpectrumSettingsDialog(QDialog):
         self.cb_cmap.setCurrentIndex(max(0, self.cb_cmap.findData("magma")))
         self.cb_domain.setCurrentIndex(max(0, self.cb_domain.findData("db")))
         self.cb_channel.setCurrentIndex(0)
-        self.sld_sat.setValueSilently(self._sat_db_to_slider(DEFAULT_WT_SAT_DB))
         self.chk_beats.setChecked(True)
         self.sp_bpm.setValue(120.0)
         self.sp_bpb.setValue(4)
-        self.sld_hide.setValueSilently(35)
+        self.sld_hide.setValueSilently(35)     # dB 域阈值 0.35 / 线性域感度 40.5
         self._on_volume_label(35)
-        self._on_sat_label()
         self._loading = False
         self._refresh_key_labels()
         self._apply()

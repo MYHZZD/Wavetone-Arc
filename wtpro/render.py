@@ -4,7 +4,9 @@ import math
 
 import numpy as np
 
-from wtpro.color import DEFAULT_WT_SAT_DB, WT_SAT_DB_MAX, WT_SAT_DB_MIN
+from wtpro.color import (
+    DEFAULT_WT_SAT_DB, WT_SAT_DB_MAX, WT_SAT_DB_MIN, wt_default_linear_sat_db
+)
 from wtpro.common import (
     DB_FLOOR, DEFAULT_ROWS_PER_SEMITONE, DISPLAY_GAMMA, F32, F64, MIDI_MAX, _int_opt,
     _num_opt
@@ -44,7 +46,8 @@ DEFAULT_FILTER_CONFIG = {
     "sig_center": 0.30,   # sigmoid 拐点，占显示范围的比例（1.0 = DB_FLOOR）
     "sig_k": 0.50,        # sigmoid 过渡宽度，占拐点深度的比例
     "domain": "db",       # db | linear —— linear 复刻 WaveTone 的线性显示
-    "sat_db": DEFAULT_WT_SAT_DB,  # 线性域的饱和起点（dB）
+    # 线性域的默认感度（dB 刻度）。不是感度 100 那个锚点 —— 那一档过曝。
+    "sat_db": wt_default_linear_sat_db(),
     "wt_contrast": 25,    # WaveTone 对比度 0..WT_CONTRAST_MAX
     # 声道：当前显示哪一张平面（stereo | l | r）。它只是显示状态，
     # 由主窗口在切换时改写；放在默认表里是为了"配置里总有这个键"。
@@ -74,10 +77,10 @@ def _filter_config(cfg=None):
         out["curve"] = DEFAULT_FILTER_CONFIG["curve"]
     if out.get("domain") not in DOMAIN_MODES:
         out["domain"] = DEFAULT_FILTER_CONFIG["domain"]
-    # 饱和起点夹到滑杆量程内；NaN/无穷也一并退回默认值
+    # 感度（dB 刻度）夹到量程内；NaN/无穷也一并退回默认值
     sat = out["sat_db"]
     if not math.isfinite(sat):
-        sat = DEFAULT_WT_SAT_DB
+        sat = wt_default_linear_sat_db()
     out["sat_db"] = max(WT_SAT_DB_MIN, min(WT_SAT_DB_MAX, sat))
     out["wt_contrast"] = int(round(_num_opt(out.get("wt_contrast"),
                                             DEFAULT_FILTER_CONFIG["wt_contrast"])))
@@ -317,7 +320,7 @@ def semitone_step_filter(db, rows_per_semitone=DEFAULT_ROWS_PER_SEMITONE,
 
 
 def db_to_u8(db, floor_db=DB_FLOOR, hide_low=0.0, gamma=DISPLAY_GAMMA,
-             domain="db", sat_db=DEFAULT_WT_SAT_DB):
+             domain="db", sat_db=None):
     """dB → 0..255 的色号。
 
     两个域的区别只在第一层映射：
@@ -329,19 +332,33 @@ def db_to_u8(db, floor_db=DB_FLOOR, hide_low=0.0, gamma=DISPLAY_GAMMA,
     domain="linear"
         **复刻 WaveTone**：直接按线性幅度映射，全程不作对数运算。
             norm = 10^(db/20) × gain,  gain = 10^(-sat_db/20)
-        sat_db 为饱和起点：高于该电平的部分一律取调色板上限（饱和），
-        低于该电平的部分按指数关系迅速衰减至调色板下端。默认 -22.13 dB
-        对应 WaveTone 的固定增益 12.78，故默认取值即正版观感（界面上显示为
-        -22.1，滑杆精度 0.1 dB）。映射为纯指数关系，-60 dB（幅度的千分之一）
-        即落到色号 0，因此暗场压缩明显、峰值区域成片饱和。
+        sat_db 是感度的另一种写法：越小增益越大、画面越亮。默认值取
+        wt_default_linear_sat_db()（感度 40.5 ≈ −14.28 dB，曝光 5.18，
+        可见范围约 14 dB）—— 早先用的是感度 100（−22.13 dB、曝光 12.8），
+        只有峰值上方 22 dB 以内不过曝，实测太糊，已废弃。
 
-    sat_db 支持标量或与 db 同形状的数组（后者供调试与实验用）。
-    其后的 hide_low（亮度滤镜）与 gamma 由两个域共用。
+    sat_db 为 None 时取默认；支持标量或与 db 同形状的数组（供调试用）。
+    其后的 hide_low（亮度截断）是一个**阈值**：低于它的归一化幅度一律压到
+    调色板下端。先把归一化值减掉阈值、再按 (1−阈值) 重新拉伸。
+
+    ⚠️ 亮度截断**只在 dB 域生效**。线性域里那个滑块控制的是感度（见
+    wtpro.dialogs），不再兼做截断 —— 线性映射的归一化幅度低处密集，套阈值
+    要么看不出效果、要么一片全黑，实测下来不划算。所以线性域传进来的
+    hide_low 一律忽略（这里也主动清零，避免额外的无用重算）。
     """
     db = np.asarray(db, dtype=F32)
-    if str(domain) == "linear":
-        # 饱和起点反推增益。三种退化情况都让这一档"透明"（增益 1、起点 0 dB）：
-        # sat_db 未设、非有限、或 >= 0（起点抬到 0 dB 就没有可饱和的区域了）。
+    linear = str(domain) == "linear"
+    if sat_db is None:
+        sat_db = wt_default_linear_sat_db()
+    hide = float(hide_low) if hide_low else 0.0
+    # 阈值取闭区间 [0, 1]：**1.0 是合法的**（表示"全部压到最低"，整幅纯黑）。
+    # 之前写成开区间 (0, 1)，滑块拉到 100% 时会被当成非法值清零，于是
+    # "100% 与 0% 一样全亮" —— 一个边界条件写错导致的假象。
+    if linear or not (0.0 <= hide <= 1.0):
+        hide = 0.0
+    if linear:
+        # 感度反推增益。三种退化情况都让这一档"透明"（增益 1）：
+        # sat_db 非有限、或 >= 0（起点抬到 0 dB 就没有可饱和的区域了）。
         # 先夹到 -400 dB 只是为了让 10**(-sat/20) 不溢出（那个值本来也会被 keep
         # 挡掉），夹完的结果始终有限，所以不必再操心浮点告警。
         sat = np.asarray(sat_db, dtype=F32)
@@ -358,9 +375,15 @@ def db_to_u8(db, floor_db=DB_FLOOR, hide_low=0.0, gamma=DISPLAY_GAMMA,
         norm = np.empty_like(db, dtype=F32)
         np.subtract(db, F32(floor_db), out=norm)
         norm *= F32(1.0 / span)
-    if hide_low > 0.0:
-        inv = 1.0 / max(1.0 - hide_low, 1e-9)
-        norm -= F32(hide_low)
+    if hide >= 1.0:
+        # 阈值 100%：全部压到最低色号（整幅纯黑）。
+        # 不能走下面那条"减阈值再按 (1−阈值) 拉伸"的通路 —— 那里 1/(1−hide)
+        # 会放大到 1e9，浮点残差把最大值又顶回 255，看着像"没截断"。
+        # 结果本来就是确定的，直接给全零最省事也最稳。
+        return np.zeros(db.shape, dtype=np.uint8)
+    if hide > 0.0:
+        inv = 1.0 / max(1.0 - hide, 1e-9)
+        norm -= F32(hide)
         np.maximum(norm, F32(0.0), out=norm)
         norm *= F32(inv)
     if gamma != 1.0:
